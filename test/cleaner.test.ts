@@ -6,8 +6,11 @@ import { describe, expect, test } from "vitest";
 
 import {
   collectCompactCandidateStats,
+  collectLogCleanupStats,
   collectStaleArchiveCandidateStats,
   compactWhere,
+  nextBackupPath,
+  resolveCodexSpawnCommand,
   rolloutThreadId,
 } from "../src/cleaner.js";
 
@@ -25,6 +28,7 @@ describe("compactWhere", () => {
       archivedOnly: true,
       cutoffMs: 123,
       maxChars: 1024,
+      protectRecent: true,
       protectedIds: new Set(["thread-b", "thread-a"]),
     });
 
@@ -37,6 +41,188 @@ describe("compactWhere", () => {
       protected0: "thread-a",
       protected1: "thread-b",
     });
+  });
+});
+
+describe("resolveCodexSpawnCommand", () => {
+  test("runs the Windows npm codex shim through node", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    const script = path.join(dir, "node_modules", "@openai", "codex", "bin", "codex.js");
+    const shim = path.join(dir, "codex.cmd");
+    try {
+      fs.mkdirSync(path.dirname(script), { recursive: true });
+      fs.writeFileSync(script, "");
+      fs.writeFileSync(shim, "");
+
+      const resolved = await resolveCodexSpawnCommand(shim, ["app-server", "--listen", "stdio://"], "win32");
+
+      expect(resolved).toEqual({
+        args: [script, "app-server", "--listen", "stdio://"],
+        command: process.execPath,
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("runs repo-local Windows npm codex shims through node", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    const nodeModules = path.join(dir, "node_modules");
+    const script = path.join(nodeModules, "@openai", "codex", "bin", "codex.js");
+    const shim = path.join(nodeModules, ".bin", "codex.cmd");
+    try {
+      fs.mkdirSync(path.dirname(script), { recursive: true });
+      fs.mkdirSync(path.dirname(shim), { recursive: true });
+      fs.writeFileSync(script, "");
+      fs.writeFileSync(shim, "");
+
+      const resolved = await resolveCodexSpawnCommand(shim, ["app-server"], "win32");
+
+      expect(resolved).toEqual({
+        args: [script, "app-server"],
+        command: process.execPath,
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("leaves non-Windows commands untouched", async () => {
+    await expect(resolveCodexSpawnCommand("codex", ["app-server"], "linux")).resolves.toEqual({
+      args: ["app-server"],
+      command: "codex",
+    });
+  });
+
+  test("refuses non-npm Windows batch commands", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    try {
+      const shim = path.join(dir, "custom-codex.cmd");
+      fs.writeFileSync(shim, "");
+
+      await expect(resolveCodexSpawnCommand(shim, ["app-server"], "win32")).rejects.toThrow(
+        "Refusing to wrap a Windows batch Codex command",
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("uses an executable Windows match before rejecting an unhandled batch shim", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    try {
+      const batch = path.join(dir, "codex.cmd");
+      const executable = path.join(dir, "codex.exe");
+      fs.writeFileSync(batch, "");
+      fs.writeFileSync(executable, "");
+
+      const resolved = await resolveCodexSpawnCommand("codex", ["app-server"], "win32", [batch, executable]);
+
+      expect(resolved).toEqual({
+        args: ["app-server"],
+        command: executable,
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps an earlier Windows executable ahead of a later npm shim", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    try {
+      const executable = path.join(dir, "codex.exe");
+      const shimDir = path.join(dir, "npm-prefix");
+      const shim = path.join(shimDir, "codex.cmd");
+      const script = path.join(shimDir, "node_modules", "@openai", "codex", "bin", "codex.js");
+      fs.mkdirSync(path.dirname(script), { recursive: true });
+      fs.writeFileSync(executable, "");
+      fs.writeFileSync(shim, "");
+      fs.writeFileSync(script, "");
+
+      const resolved = await resolveCodexSpawnCommand("codex", ["app-server"], "win32", [executable, shim]);
+
+      expect(resolved).toEqual({
+        args: ["app-server"],
+        command: executable,
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("nextBackupPath", () => {
+  test("does not reuse an existing backup name in the same millisecond", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    try {
+      const now = new Date("2026-05-22T21:41:25.123Z");
+      const first = nextBackupPath(path.join(dir, "state_5.sqlite"), dir, now);
+      fs.writeFileSync(first, "");
+
+      const second = nextBackupPath(path.join(dir, "state_5.sqlite"), dir, now);
+
+      expect(path.basename(first)).toBe("state_5.sqlite.20260522T214125_123Z.bak.sqlite");
+      expect(path.basename(second)).toBe("state_5.sqlite.20260522T214125_123Z.2.bak.sqlite");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("collectLogCleanupStats", () => {
+  test("counts old rows separately from oversized retained log bodies", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    const db = new Database(path.join(dir, "logs_2.sqlite"));
+    try {
+      db.exec(`
+        CREATE TABLE logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER NOT NULL,
+          ts_nanos INTEGER NOT NULL,
+          level TEXT NOT NULL,
+          target TEXT NOT NULL,
+          feedback_log_body TEXT,
+          module_path TEXT,
+          file TEXT,
+          line INTEGER,
+          thread_id TEXT,
+          process_uuid TEXT,
+          estimated_bytes INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      const insert = db.prepare(
+        "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, estimated_bytes) VALUES (?, 0, 'INFO', 'target', ?, ?)",
+      );
+      insert.run(100, "old body".repeat(100), 1000);
+      insert.run(Math.floor(Date.now() / 1000), "x".repeat(50), 50);
+      insert.run(Math.floor(Date.now() / 1000), "y".repeat(200000), 200000);
+
+      const stats = collectLogCleanupStats(db, {
+        allowRunningReadonly: false,
+        apply: false,
+        archiveStale: true,
+        archivedOnly: false,
+        confirmArchiveStale: false,
+        compactRecentMetadata: false,
+        confirmLossyMetadata: false,
+        confirmPruneLogs: false,
+        includeLogs: true,
+        includeRollouts: false,
+        json: false,
+        keepLogDays: 7,
+        keepRecentDays: 14,
+        maxChars: 1024,
+        maxLogBodyChars: 100,
+        pruneLogs: true,
+      });
+
+      expect(stats.delete_rows).toBe(1);
+      expect(stats.cap_rows).toBe(1);
+      expect(stats.cap_estimated_savings_mib).toBeGreaterThan(0);
+    } finally {
+      db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -70,11 +256,22 @@ describe("collectCompactCandidateStats", () => {
         archivedOnly: false,
         cutoffMs: 5000,
         maxChars: 10,
+        protectRecent: true,
         protectedIds: new Set(["old-protected"]),
       });
 
       expect(stats.rows).toBe(1);
       expect(stats.max_field_chars).toBe(30);
+
+      const statsWithRecent = collectCompactCandidateStats(db, {
+        archivedOnly: false,
+        cutoffMs: 5000,
+        maxChars: 10,
+        protectRecent: false,
+        protectedIds: new Set(["old-protected"]),
+      });
+
+      expect(statsWithRecent.rows).toBe(2);
     } finally {
       db.close();
       fs.rmSync(dir, { recursive: true, force: true });

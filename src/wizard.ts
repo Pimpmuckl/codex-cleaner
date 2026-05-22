@@ -2,10 +2,8 @@ import { confirm, input, select } from "@inquirer/prompts";
 import pc from "picocolors";
 
 import {
-  archiveStaleThreads,
   buildScanReport,
-  checkpointWal,
-  compactMetadata,
+  cleanCodex,
   findBlockingProcesses,
   requireStoppedOrReadonlyAllowed,
 } from "./cleaner.js";
@@ -34,7 +32,9 @@ export async function runWizard(options: CleanerOptions): Promise<number> {
 
   const keepRecentDays = await askKeepRecentDays(options.keepRecentDays);
   const maxChars = await askMaxChars(options.maxChars);
+  const compactRecentMetadata = await askCompactRecentMetadata();
   const archiveStale = await askArchiveStale();
+  const pruneLogs = await askPruneLogs();
   const includeRollouts = await confirm({
     default: false,
     message: "Also scan orphan rollout files? This is slower and stays dry-run only.",
@@ -50,10 +50,13 @@ export async function runWizard(options: CleanerOptions): Promise<number> {
     archiveStale,
     apply: false,
     archivedOnly: false,
+    compactRecentMetadata,
     confirmArchiveStale: false,
     confirmLossyMetadata: false,
+    confirmPruneLogs: false,
     includeLogs: false,
     includeRollouts,
+    pruneLogs,
     keepRecentDays,
     maxChars,
     json: false,
@@ -70,8 +73,11 @@ export async function runWizard(options: CleanerOptions): Promise<number> {
 
   const compactRows = numberAt(report, "compactMetadataCandidates", "rows");
   const archiveRows = numberAt(report, "staleArchiveCandidates", "archive_call_rows");
-  if (!compactRows && !archiveRows) {
-    console.log(pc.green("\nNo metadata compaction or stale archive candidates found under this policy."));
+  const logRows =
+    numberAt(report, "logCleanupCandidates", "delete_rows") + numberAt(report, "logCleanupCandidates", "cap_rows");
+  const vacuumMib = numberAt(report, "databaseSpace", "state_5.sqlite", "free_mib");
+  if (!compactRows && !archiveRows && !logRows && !vacuumMib) {
+    console.log(pc.green("\nNo cleanup candidates found under this policy."));
     return 0;
   }
 
@@ -95,29 +101,21 @@ export async function runWizard(options: CleanerOptions): Promise<number> {
   }
 
   await requireStoppedOrReadonlyAllowed({ allowRunningReadonly: false, mutating: true });
-  let archiveReport: Record<string, unknown> | null = null;
-  if (archiveRows) {
-    console.log(pc.dim("\nArchiving stale threads via Codex app-server..."));
-    archiveReport = await archiveStaleThreads({
-      ...dryRunOptions,
-      apply: true,
-      confirmArchiveStale: true,
-    });
-  }
-
-  console.log(pc.dim("\nCreating backup and compacting metadata..."));
-  const compactReport = await compactMetadata({
+  console.log(pc.dim("\nApplying cleanup..."));
+  const applyReport = await cleanCodex({
     ...dryRunOptions,
     apply: true,
     confirmArchiveStale: true,
     confirmLossyMetadata: true,
+    confirmPruneLogs: true,
   });
-  console.log(pc.dim("\nCheckpointing state_5.sqlite WAL..."));
-  const checkpointReport = await checkpointWal({
-    ...dryRunOptions,
-    apply: true,
-  });
-  printApplySummary(compactReport, archiveReport, checkpointReport);
+  printApplySummary(
+    recordAt(applyReport, "compact"),
+    nullableRecordAt(applyReport, "archive"),
+    recordAt(applyReport, "vacuum"),
+    nullableRecordAt(applyReport, "logs"),
+    recordAt(applyReport, "checkpoint"),
+  );
   return 0;
 }
 
@@ -167,6 +165,19 @@ async function askMaxChars(currentDefault: number): Promise<number> {
   return askPositiveInteger("Characters to keep per metadata field", String(currentDefault));
 }
 
+async function askCompactRecentMetadata(): Promise<boolean> {
+  console.log(pc.bold("\nRecent metadata compaction"));
+  console.log(
+    pc.dim(
+      "This also caps recent unprotected thread display/search metadata. Pinned, app/heartbeat, and active-goal threads still stay untouched, and rollout JSONL context is not changed.",
+    ),
+  );
+  return confirm({
+    default: false,
+    message: "Also compact recent unprotected metadata?",
+  });
+}
+
 async function askArchiveStale(): Promise<boolean> {
   console.log(pc.bold("\nStale thread archiving"));
   console.log(
@@ -177,6 +188,19 @@ async function askArchiveStale(): Promise<boolean> {
   return confirm({
     default: true,
     message: "Include stale thread archiving in this cleanup?",
+  });
+}
+
+async function askPruneLogs(): Promise<boolean> {
+  console.log(pc.bold("\nLog cleanup"));
+  console.log(
+    pc.dim(
+      "This prunes old logs_2.sqlite rows and caps giant feedback_log_body payloads. It does not touch threads or rollout JSONL.",
+    ),
+  );
+  return confirm({
+    default: true,
+    message: "Include logs_2.sqlite cleanup in this cleanup?",
   });
 }
 
@@ -211,6 +235,7 @@ function printDryRunSummary(report: Record<string, unknown>): void {
   console.log(`  Codex home: ${String(report.codexHome)}`);
   console.log(`  Recent window: ${String(policy.keepRecentDays)} days`);
   console.log(`  Metadata cap: ${String(policy.maxChars)} chars`);
+  console.log(`  Compact recent metadata: ${policy.compactRecentMetadata ? "yes" : "no"}`);
   console.log(`  state_5.sqlite: ${formatMib(stateMain.mib)} main, ${formatMib(stateWal.mib)} WAL`);
   console.log(
     `  Protected threads: ${String(protection.totalUniqueProtectedThreads)} (${String(protection.pinnedThreads)} pinned, ${String(
@@ -245,6 +270,20 @@ function printDryRunSummary(report: Record<string, unknown>): void {
       );
     }
   }
+  const stateSpace = recordAt(report, "databaseSpace", "state_5.sqlite");
+  if (Number(stateSpace.free_mib) > 0) {
+    console.log(pc.green(`  State vacuum: reclaim about ${formatMib(stateSpace.free_mib)} from SQLite freelist`));
+  }
+  const logCleanup = recordAt(report, "logCleanupCandidates");
+  if (Object.keys(logCleanup).length) {
+    console.log(
+      pc.green(
+        `  Logs cleanup: delete ${String(logCleanup.delete_rows)} old rows and cap ${String(
+          logCleanup.cap_rows,
+        )} oversized log payloads`,
+      ),
+    );
+  }
   console.log(pc.dim("  Preserves thread rows, rollout JSONL, and CodexMeter usage accounting."));
 
   const rollouts = recordAt(report, "rollouts");
@@ -262,6 +301,8 @@ function printDryRunSummary(report: Record<string, unknown>): void {
 function printApplySummary(
   report: Record<string, unknown>,
   archiveReport: Record<string, unknown> | null,
+  vacuumReport: Record<string, unknown>,
+  logsReport: Record<string, unknown> | null,
   checkpointReport: Record<string, unknown>,
 ): void {
   const before = recordAt(report, "before");
@@ -285,23 +326,36 @@ function printApplySummary(
   console.log(`  Changed rows: ${String(report.changedRows)}`);
   console.log(`  Metadata backup: ${String(report.backupPath)}`);
   console.log(`  Remaining eligible rows: ${String(after.rows)} (was ${String(before.rows)})`);
+  const vacuumBefore = recordAt(vacuumReport, "before", "main");
+  const vacuumAfter = recordAt(vacuumReport, "after", "main");
+  console.log(`  State vacuum: ${formatMib(vacuumBefore.mib)} -> ${formatMib(vacuumAfter.mib)}`);
+  if (logsReport) {
+    console.log(
+      `  Logs cleanup: deleted ${String(logsReport.deletedRows ?? 0)} rows, capped ${String(
+        logsReport.cappedRows ?? 0,
+      )} rows`,
+    );
+  }
   const checkpointBefore = recordAt(checkpointReport, "before", "wal");
   const checkpointAfter = recordAt(checkpointReport, "after", "wal");
   console.log(`  WAL checkpoint: ${formatMib(checkpointBefore.mib)} -> ${formatMib(checkpointAfter.mib)}`);
-  console.log(pc.dim("  Note: returning main SQLite file space to the OS requires a separate vacuum/rebuild step."));
 }
 
 function printDryRunCommand(options: CleanerOptions): void {
   const archiveFlag = options.archiveStale ? "" : " --skip-archive-stale";
+  const logsFlag = options.pruneLogs ? " --prune-logs" : "";
+  const recentFlag = options.compactRecentMetadata ? " --compact-recent-metadata" : "";
   console.log(
-    `  npx codex-cleaner@latest --allow-running-readonly clean --max-chars ${options.maxChars} --keep-recent-days ${options.keepRecentDays}${archiveFlag}`,
+    `  npx codex-cleaner@latest --allow-running-readonly clean --max-chars ${options.maxChars} --keep-recent-days ${options.keepRecentDays}${archiveFlag}${logsFlag}${recentFlag}`,
   );
 }
 
 function printApplyCommand(options: CleanerOptions): void {
   const archiveFlags = options.archiveStale ? " --confirm-archive-stale" : " --skip-archive-stale";
+  const logsFlags = options.pruneLogs ? " --prune-logs --confirm-prune-logs" : "";
+  const recentFlag = options.compactRecentMetadata ? " --compact-recent-metadata" : "";
   console.log(
-    `  npx codex-cleaner@latest clean --max-chars ${options.maxChars} --keep-recent-days ${options.keepRecentDays} --apply --confirm-lossy-metadata${archiveFlags}`,
+    `  npx codex-cleaner@latest clean --max-chars ${options.maxChars} --keep-recent-days ${options.keepRecentDays} --apply --confirm-lossy-metadata${archiveFlags}${logsFlags}${recentFlag}`,
   );
 }
 
@@ -312,6 +366,11 @@ function recordAt(source: unknown, ...keys: string[]): Record<string, unknown> {
     current = (current as Record<string, unknown>)[key];
   }
   return current && typeof current === "object" && !Array.isArray(current) ? (current as Record<string, unknown>) : {};
+}
+
+function nullableRecordAt(source: unknown, ...keys: string[]): Record<string, unknown> | null {
+  const value = recordAt(source, ...keys);
+  return Object.keys(value).length ? value : null;
 }
 
 function numberAt(source: unknown, ...keys: string[]): number {

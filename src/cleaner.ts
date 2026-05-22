@@ -12,7 +12,14 @@ const execFileAsync = promisify(execFile);
 
 const THREAD_COLUMNS_TO_CAP = ["title", "preview", "first_user_message"] as const;
 const APP_SERVER_REQUEST_TIMEOUT_MS = 60_000;
+const APP_SERVER_WINDOWS_TERMINATE_DELAY_MS = 1000;
 const APP_SERVER_SHUTDOWN_TIMEOUT_MS = 3000;
+const WINDOWS_BATCH_EXTENSIONS = new Set([".bat", ".cmd"]);
+
+type CodexSpawnCommand = {
+  args: string[];
+  command: string;
+};
 
 export async function requireStoppedOrReadonlyAllowed(args: {
   allowRunningReadonly: boolean;
@@ -92,8 +99,11 @@ async function findPosixBlockingProcesses(): Promise<BlockingProcess[]> {
 async function archiveThreadsViaCodexAppServer(
   threadIds: string[],
   codexCommand: string,
+  codexHome: string,
 ): Promise<Record<string, unknown>> {
-  const child = spawn(codexCommand, ["app-server", "--listen", "stdio://"], {
+  const spawnCommand = await resolveCodexSpawnCommand(codexCommand, ["app-server", "--listen", "stdio://"]);
+  const child = spawn(spawnCommand.command, spawnCommand.args, {
+    env: { ...process.env, CODEX_HOME: codexHome },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -198,8 +208,77 @@ async function archiveThreadsViaCodexAppServer(
     succeeded,
     failed: errors.length,
     errors: errors.slice(0, 20),
+    codexHome,
     stderrTail: stderrBuffer.trim(),
   };
+}
+
+export async function resolveCodexSpawnCommand(
+  codexCommand: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+  windowsMatches?: string[],
+): Promise<CodexSpawnCommand> {
+  if (platform !== "win32") return { args, command: codexCommand };
+
+  const matches = windowsMatches ?? (await resolveWindowsCommandMatches(codexCommand));
+  let firstBatchMatch: string | null = null;
+  for (const match of matches) {
+    const npmScript = codexNpmScriptPath(match);
+    if (npmScript) {
+      return { args: [npmScript, ...args], command: process.execPath };
+    }
+    if (isWindowsExecutableMatch(match)) return { args, command: match };
+    if (WINDOWS_BATCH_EXTENSIONS.has(path.extname(match).toLowerCase())) {
+      firstBatchMatch ??= match;
+    }
+  }
+
+  if (firstBatchMatch) {
+    throw new Error(
+      `Refusing to wrap a Windows batch Codex command because child app-server cleanup would not own the process tree: ${firstBatchMatch}`,
+    );
+  }
+  return { args, command: matches[0] ?? codexCommand };
+}
+
+async function resolveWindowsCommandMatches(command: string): Promise<string[]> {
+  if (hasPathSeparator(command)) return [path.resolve(command)];
+
+  const matches = await findWindowsCommandMatches(command);
+  return matches.length ? matches : [command];
+}
+
+async function findWindowsCommandMatches(command: string): Promise<string[]> {
+  try {
+    const { stdout } = await execFileAsync("where.exe", [command], { windowsHide: true });
+    return stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function codexNpmScriptPath(command: string): string | null {
+  const basename = path.basename(command).toLowerCase();
+  if (!["codex", "codex.bat", "codex.cmd"].includes(basename)) return null;
+
+  const commandDir = path.dirname(command);
+  const candidates = [
+    path.join(commandDir, "node_modules", "@openai", "codex", "bin", "codex.js"),
+    path.join(commandDir, "..", "@openai", "codex", "bin", "codex.js"),
+  ];
+  return candidates.find((script) => fs.existsSync(script)) ?? null;
+}
+
+function hasPathSeparator(value: string): boolean {
+  return value.includes("/") || value.includes("\\");
+}
+
+function isWindowsExecutableMatch(command: string): boolean {
+  return [".com", ".exe"].includes(path.extname(command).toLowerCase());
 }
 
 function handleAppServerLine(
@@ -236,25 +315,36 @@ function handleAppServerLine(
 async function stopAppServer(child: ChildProcessWithoutNullStreams): Promise<void> {
   if (child.exitCode != null || child.signalCode != null) return;
   await new Promise<void>((resolve) => {
-    const timeout = setTimeout(() => {
+    let settled = false;
+    const timers: NodeJS.Timeout[] = [];
+    const done = (): void => {
+      if (settled) return;
+      settled = true;
+      for (const timer of timers) clearTimeout(timer);
+      resolve();
+    };
+    const terminate = (): void => {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // Process already exited.
+      }
+    };
+    if (process.platform === "win32") {
+      // Windows kill() is forceful; give stdin EOF a brief chance to flush SQLite first.
+      timers.push(setTimeout(terminate, APP_SERVER_WINDOWS_TERMINATE_DELAY_MS));
+    } else {
+      terminate();
+    }
+    timers.push(setTimeout(() => {
       try {
         child.kill("SIGKILL");
       } catch {
         // Process already exited.
       }
-      resolve();
-    }, APP_SERVER_SHUTDOWN_TIMEOUT_MS);
-    const done = (): void => {
-      clearTimeout(timeout);
-      resolve();
-    };
-    child.once("exit", done);
-    try {
-      child.kill("SIGTERM");
-    } catch {
-      child.off("exit", done);
       done();
-    }
+    }, APP_SERVER_SHUTDOWN_TIMEOUT_MS));
+    child.once("exit", done);
   });
 }
 
@@ -271,7 +361,10 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
     codexHome,
     generatedAt: new Date().toISOString(),
     policy: {
+      compactRecentMetadata: options.compactRecentMetadata,
+      keepLogDays: options.keepLogDays,
       keepRecentDays: options.keepRecentDays,
+      maxLogBodyChars: options.maxLogBodyChars,
       maxChars: options.maxChars,
       recentCutoffMs: cutoffMs,
       recentCutoffUtc: millisToIso(cutoffMs),
@@ -295,17 +388,22 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
 
   const db = openReadonlyDb(stateDb);
   try {
+    report.databaseSpace = {
+      "state_5.sqlite": collectSqliteSpaceStats(db),
+    };
     report.threads = collectThreadStats(db);
     report.compactMetadataCandidates = collectCompactCandidateStats(db, {
       archivedOnly: false,
       cutoffMs,
       maxChars: options.maxChars,
+      protectRecent: !options.compactRecentMetadata,
       protectedIds: allProtectedIds(protection),
     });
     report.compactMetadataCandidatesArchivedOnly = collectCompactCandidateStats(db, {
       archivedOnly: true,
       cutoffMs,
       maxChars: options.maxChars,
+      protectRecent: !options.compactRecentMetadata,
       protectedIds: allProtectedIds(protection),
     });
     if (options.archiveStale) {
@@ -332,10 +430,14 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
     db.close();
   }
 
-  if (options.includeLogs && fs.existsSync(logsDb)) {
+  if ((options.includeLogs || options.pruneLogs) && fs.existsSync(logsDb)) {
     const logs = openReadonlyDb(logsDb);
     try {
       report.logs = collectLogStats(logs);
+      report.logCleanupCandidates = collectLogCleanupStats(logs, options);
+      const databaseSpace = asRecord(report.databaseSpace);
+      databaseSpace["logs_2.sqlite"] = collectSqliteSpaceStats(logs);
+      report.databaseSpace = databaseSpace;
     } finally {
       logs.close();
     }
@@ -373,6 +475,7 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
       archivedOnly: options.archivedOnly,
       cutoffMs,
       maxChars: options.maxChars,
+      protectRecent: !options.compactRecentMetadata,
       protectedIds,
     });
 
@@ -385,6 +488,7 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
         archivedOnly: options.archivedOnly,
         cutoffMs,
         maxChars: options.maxChars,
+        protectRecent: !options.compactRecentMetadata,
         protectedIds,
       });
       const assignments = THREAD_COLUMNS_TO_CAP.map(
@@ -400,6 +504,7 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
       archivedOnly: options.archivedOnly,
       cutoffMs,
       maxChars: options.maxChars,
+      protectRecent: !options.compactRecentMetadata,
       protectedIds,
     });
 
@@ -410,6 +515,7 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
       generatedAt: new Date().toISOString(),
       policy: {
         archivedOnly: options.archivedOnly,
+        compactRecentMetadata: options.compactRecentMetadata,
         keepRecentDays: options.keepRecentDays,
         maxChars: options.maxChars,
         protectedThreads: protectedIds.size,
@@ -433,6 +539,9 @@ export async function cleanCodex(options: CleanerOptions): Promise<Record<string
   if (options.apply && options.archiveStale && !options.confirmArchiveStale) {
     throw new Error("--apply with stale archiving requires --confirm-archive-stale");
   }
+  if (options.apply && options.pruneLogs && !options.confirmPruneLogs) {
+    throw new Error("--apply with log cleanup requires --confirm-prune-logs");
+  }
 
   const scan = buildScanReport({ ...options, apply: false });
   if (!options.apply) {
@@ -445,6 +554,9 @@ export async function cleanCodex(options: CleanerOptions): Promise<Record<string
 
   const archive = options.archiveStale ? await archiveStaleThreads(options) : null;
   const compact = await compactMetadata(options);
+  const hasStateBackup = Boolean(asRecord(archive).backupPath || asRecord(compact).backupPath);
+  const vacuum = await vacuumStateDatabase(options, !hasStateBackup);
+  const logs = options.pruneLogs ? await cleanLogs(options) : null;
   const checkpoint = await checkpointWal(options);
 
   return {
@@ -456,6 +568,8 @@ export async function cleanCodex(options: CleanerOptions): Promise<Record<string
     scan,
     archive,
     compact,
+    vacuum,
+    logs,
     checkpoint,
   };
 }
@@ -487,7 +601,11 @@ export async function archiveStaleThreads(options: CleanerOptions): Promise<Reco
       stateDb,
       options.backupDir ?? path.join(codexHome, ".codex-cleanup-backups"),
     );
-    appServerResult = await archiveThreadsViaCodexAppServer(beforePlan.archiveCallIds, options.codexCommand ?? "codex");
+    appServerResult = await archiveThreadsViaCodexAppServer(
+      beforePlan.archiveCallIds,
+      options.codexCommand ?? "codex",
+      codexHome,
+    );
   }
 
   const afterDb = openReadonlyDb(stateDb);
@@ -521,14 +639,9 @@ export async function checkpointWal(options: CleanerOptions): Promise<Record<str
   const codexHome = resolveCodexHome(options);
   const stateDb = path.join(codexHome, "state_5.sqlite");
   const before = fileTripletSizes(stateDb);
-  let backupPath: string | null = null;
   let checkpointResult: unknown = null;
 
   if (options.apply) {
-    backupPath = await backupSqliteDatabase(
-      stateDb,
-      options.backupDir ?? path.join(codexHome, ".codex-cleanup-backups"),
-    );
     const db = openWritableDb(stateDb);
     try {
       checkpointResult = queryAll(db, "PRAGMA wal_checkpoint(TRUNCATE)");
@@ -545,19 +658,121 @@ export async function checkpointWal(options: CleanerOptions): Promise<Record<str
     before,
     after: fileTripletSizes(stateDb),
     checkpointResult,
-    backupPath,
+    backupPath: null,
   };
+}
+
+export async function vacuumStateDatabase(
+  options: CleanerOptions,
+  backupBeforeVacuum = true,
+): Promise<Record<string, unknown>> {
+  const codexHome = resolveCodexHome(options);
+  const stateDb = path.join(codexHome, "state_5.sqlite");
+  return vacuumSqliteDatabase({
+    action: "vacuum-state",
+    apply: options.apply,
+    backupBeforeVacuum,
+    backupDir: options.backupDir ?? path.join(codexHome, ".codex-cleanup-backups"),
+    codexHome,
+    dbPath: stateDb,
+  });
+}
+
+export async function cleanLogs(options: CleanerOptions): Promise<Record<string, unknown>> {
+  if (options.apply && !options.confirmPruneLogs) {
+    throw new Error("--apply requires --confirm-prune-logs");
+  }
+
+  const codexHome = resolveCodexHome(options);
+  const logsDb = path.join(codexHome, "logs_2.sqlite");
+  if (!fs.existsSync(logsDb)) {
+    return {
+      action: "clean-logs",
+      mode: options.apply ? "apply" : "dry-run",
+      codexHome,
+      generatedAt: new Date().toISOString(),
+      exists: false,
+    };
+  }
+
+  const db = openWritableDb(logsDb);
+  let backupPath: string | null = null;
+  let cappedRows = 0;
+  let deletedRows = 0;
+  try {
+    const beforeFiles = fileTripletSizes(logsDb);
+    const before = collectLogCleanupStats(db, options);
+    const beforeSpace = collectSqliteSpaceStats(db);
+    const hasRowChanges = Number(before.cap_rows) > 0 || Number(before.delete_rows) > 0;
+    const shouldVacuum = Number(beforeSpace.freelist_count) > 0 || hasRowChanges;
+    if (options.apply && shouldVacuum) {
+      backupPath = await backupSqliteDatabase(
+        logsDb,
+        options.backupDir ?? path.join(codexHome, ".codex-cleanup-backups"),
+      );
+      const cutoffSeconds = logCutoffSeconds(options.keepLogDays);
+      if (hasRowChanges) {
+        const tx = db.transaction(() => {
+          deletedRows = Number(
+            db.prepare("DELETE FROM logs WHERE ts < @cutoffSeconds").run({ cutoffSeconds }).changes,
+          );
+          cappedRows = Number(
+            db
+              .prepare(
+                `
+                UPDATE logs
+                SET estimated_bytes = max(0, estimated_bytes - (length(feedback_log_body) - @maxLogBodyChars)),
+                    feedback_log_body = substr(feedback_log_body, 1, @maxLogBodyChars)
+                WHERE ts >= @cutoffSeconds
+                  AND feedback_log_body IS NOT NULL
+                  AND length(feedback_log_body) > @maxLogBodyChars
+              `,
+              )
+              .run({ cutoffSeconds, maxLogBodyChars: options.maxLogBodyChars }).changes,
+          );
+        });
+        tx();
+      }
+      db.exec("VACUUM");
+      queryAll(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+    const after = collectLogCleanupStats(db, options);
+    const afterSpace = collectSqliteSpaceStats(db);
+    return {
+      action: "clean-logs",
+      mode: options.apply ? "apply" : "dry-run",
+      codexHome,
+      generatedAt: new Date().toISOString(),
+      policy: {
+        keepLogDays: options.keepLogDays,
+        maxLogBodyChars: options.maxLogBodyChars,
+      cutoffSeconds: logCutoffSeconds(options.keepLogDays),
+      cutoffUtc: secondsToIso(logCutoffSeconds(options.keepLogDays)),
+      },
+      beforeFiles,
+      afterFiles: fileTripletSizes(logsDb),
+      before,
+      after,
+      beforeSpace,
+      afterSpace,
+      cappedRows,
+      deletedRows,
+      backupPath,
+    };
+  } finally {
+    db.close();
+  }
 }
 
 export function compactWhere(args: {
   archivedOnly: boolean;
   cutoffMs: number;
   maxChars: number;
+  protectRecent: boolean;
   protectedIds: Set<string>;
 }): CompactWhere {
   const clauses = [
     `(${THREAD_COLUMNS_TO_CAP.map((column) => `length(${column}) > @maxChars`).join(" OR ")})`,
-    "(updated_at_ms < @cutoffMs OR (updated_at_ms IS NULL AND updated_at * 1000 < @cutoffMs))",
   ];
   const params: Record<string, string | number> = {
     cutoffMs: args.cutoffMs,
@@ -566,6 +781,10 @@ export function compactWhere(args: {
 
   if (args.archivedOnly) {
     clauses.push("archived = 1");
+  }
+
+  if (args.protectRecent) {
+    clauses.push("(updated_at_ms < @cutoffMs OR (updated_at_ms IS NULL AND updated_at * 1000 < @cutoffMs))");
   }
 
   const protectedIds = [...args.protectedIds].sort();
@@ -583,7 +802,13 @@ export function compactWhere(args: {
 
 export function collectCompactCandidateStats(
   db: Database.Database,
-  args: { archivedOnly: boolean; cutoffMs: number; maxChars: number; protectedIds: Set<string> },
+  args: {
+    archivedOnly: boolean;
+    cutoffMs: number;
+    maxChars: number;
+    protectRecent: boolean;
+    protectedIds: Set<string>;
+  },
 ): Record<string, unknown> {
   const where = compactWhere(args);
   const savingsExpr = THREAD_COLUMNS_TO_CAP.map((column) => `max(length(${column}) - @maxChars, 0)`).join(" + ");
@@ -807,6 +1032,53 @@ function collectLogStats(db: Database.Database): Record<string, unknown> {
   };
 }
 
+export function collectLogCleanupStats(db: Database.Database, options: CleanerOptions): Record<string, unknown> {
+  const params = {
+    cutoffSeconds: logCutoffSeconds(options.keepLogDays),
+    maxLogBodyChars: options.maxLogBodyChars,
+  };
+  const stats = queryOne(
+    db,
+    `
+    SELECT
+      count(*) AS rows,
+      coalesce(sum(CASE WHEN ts < @cutoffSeconds THEN 1 ELSE 0 END), 0) AS delete_rows,
+      coalesce(round(sum(CASE WHEN ts < @cutoffSeconds THEN estimated_bytes ELSE 0 END) / 1048576.0, 2), 0)
+        AS delete_estimated_payload_mib,
+      coalesce(sum(
+        CASE
+          WHEN ts >= @cutoffSeconds
+            AND feedback_log_body IS NOT NULL
+            AND length(feedback_log_body) > @maxLogBodyChars
+          THEN 1
+          ELSE 0
+        END
+      ), 0) AS cap_rows,
+      coalesce(round(sum(
+        CASE
+          WHEN ts >= @cutoffSeconds
+            AND feedback_log_body IS NOT NULL
+            AND length(feedback_log_body) > @maxLogBodyChars
+          THEN length(feedback_log_body) - @maxLogBodyChars
+          ELSE 0
+        END
+      ) / 1048576.0, 2), 0) AS cap_estimated_savings_mib,
+      min(ts) AS min_ts,
+      max(ts) AS max_ts
+    FROM logs
+  `,
+    params,
+  );
+  return {
+    ...stats,
+    cutoffUtc: secondsToIso(params.cutoffSeconds),
+    rangeUtc: {
+      max: secondsToIso(asNumberOrNull(stats.max_ts)),
+      min: secondsToIso(asNumberOrNull(stats.min_ts)),
+    },
+  };
+}
+
 function collectRolloutLinkage(db: Database.Database, codexHome: string): Record<string, unknown> {
   const refs = queryAll(
     db,
@@ -886,16 +1158,63 @@ function loadSessionIndexIds(codexHome: string): Set<string> {
 
 async function backupSqliteDatabase(dbPath: string, backupDir: string): Promise<string> {
   fs.mkdirSync(backupDir, { recursive: true });
-  const stamp = new Date()
-    .toISOString()
-    .replace(/[-:]/g, "")
-    .replace(/\.\d{3}Z$/, "Z");
-  const backupPath = path.join(backupDir, `${path.basename(dbPath)}.${stamp}.bak.sqlite`);
+  const backupPath = nextBackupPath(dbPath, backupDir);
   const db = openWritableDb(dbPath);
   try {
     await db.backup(backupPath);
   } finally {
     db.close();
+  }
+  return backupPath;
+}
+
+async function vacuumSqliteDatabase(args: {
+  action: string;
+  apply: boolean;
+  backupBeforeVacuum: boolean;
+  backupDir: string;
+  codexHome: string;
+  dbPath: string;
+}): Promise<Record<string, unknown>> {
+  const before = fileTripletSizes(args.dbPath);
+  const db = openWritableDb(args.dbPath);
+  let backupPath: string | null = null;
+  try {
+    const beforeSpace = collectSqliteSpaceStats(db);
+    if (args.apply && Number(beforeSpace.freelist_count) > 0) {
+      if (args.backupBeforeVacuum) {
+        backupPath = await backupSqliteDatabase(args.dbPath, args.backupDir);
+      }
+      db.exec("VACUUM");
+      queryAll(db, "PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+    return {
+      action: args.action,
+      mode: args.apply ? "apply" : "dry-run",
+      codexHome: args.codexHome,
+      generatedAt: new Date().toISOString(),
+      before,
+      after: fileTripletSizes(args.dbPath),
+      beforeSpace,
+      afterSpace: collectSqliteSpaceStats(db),
+      backupPath,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+export function nextBackupPath(dbPath: string, backupDir: string, now = new Date()): string {
+  const stamp = now
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(".", "_");
+  const base = `${path.basename(dbPath)}.${stamp}`;
+  let backupPath = path.join(backupDir, `${base}.bak.sqlite`);
+  let suffix = 2;
+  while (fs.existsSync(backupPath)) {
+    backupPath = path.join(backupDir, `${base}.${String(suffix)}.bak.sqlite`);
+    suffix += 1;
   }
   return backupPath;
 }
@@ -951,6 +1270,22 @@ function fileTripletSizes(dbPath: string): Record<string, unknown> {
     path: dbPath,
     shm: fileSize(`${dbPath}-shm`),
     wal: fileSize(`${dbPath}-wal`),
+  };
+}
+
+function collectSqliteSpaceStats(db: Database.Database): Record<string, unknown> {
+  const pageCount = Number(queryOne(db, "PRAGMA page_count").page_count ?? 0);
+  const freelistCount = Number(queryOne(db, "PRAGMA freelist_count").freelist_count ?? 0);
+  const pageSize = Number(queryOne(db, "PRAGMA page_size").page_size ?? 0);
+  const freeBytes = freelistCount * pageSize;
+  const totalBytes = pageCount * pageSize;
+  return {
+    free_mib: roundMib(freeBytes),
+    freelist_count: freelistCount,
+    page_count: pageCount,
+    page_size: pageSize,
+    total_mib: roundMib(totalBytes),
+    used_mib: roundMib(totalBytes - freeBytes),
   };
 }
 
@@ -1126,6 +1461,10 @@ function recentCutoffMs(days: number): number {
   return Date.now() - days * 24 * 60 * 60 * 1000;
 }
 
+function logCutoffSeconds(days: number): number {
+  return Math.floor(recentCutoffMs(days) / 1000);
+}
+
 function secondsToIso(seconds: number | null): string | null {
   return seconds == null ? null : new Date(seconds * 1000).toISOString();
 }
@@ -1152,6 +1491,11 @@ function printHumanReport(report: Record<string, unknown>): void {
   console.log(`Generated: ${String(report.generatedAt)}`);
   if (report.policy) console.log(`Policy: ${JSON.stringify(report.policy)}`);
 
+  if (report.action === "clean" && report.mode === "apply") {
+    printCleanApplySummary(report);
+    return;
+  }
+
   const files = asRecord(report.files);
   if (Object.keys(files).length) {
     console.log("\nFiles:");
@@ -1166,6 +1510,7 @@ function printHumanReport(report: Record<string, unknown>): void {
       }
     }
   }
+  printDatabaseSpace(report.databaseSpace);
 
   printObject("Protection", report.protection);
   printObject("Threads", report.threads, [
@@ -1181,18 +1526,16 @@ function printHumanReport(report: Record<string, unknown>): void {
   printCandidate("Compact candidates", report.compactMetadataCandidates);
   printCandidate("Compact candidates archived-only", report.compactMetadataCandidatesArchivedOnly);
   printArchiveCandidate("Stale archive candidates", report.staleArchiveCandidates);
+  printLogCleanupCandidate("Log cleanup candidates", report.logCleanupCandidates);
   if (report.action === "checkpoint-wal") {
     printWalCheckpoint(report);
-  } else if (report.action === "clean") {
-    printObject("Archive apply", report.archive);
-    printObject("Compact apply", report.compact);
-    const checkpoint = asRecord(report.checkpoint);
-    if (Object.keys(checkpoint).length) printWalCheckpoint(checkpoint);
   } else {
     printCandidate("Before", report.before);
     printCandidate("After", report.after);
     printArchiveCandidate("Before", report.before);
     printArchiveCandidate("After", report.after);
+    printLogCleanupCandidate("Before", report.before);
+    printLogCleanupCandidate("After", report.after);
   }
 
   if (report.changedRows !== undefined) console.log(`\nChanged rows: ${String(report.changedRows)}`);
@@ -1217,13 +1560,113 @@ function printHumanReport(report: Record<string, unknown>): void {
   }
 }
 
+function printCleanApplySummary(report: Record<string, unknown>): void {
+  const archive = asRecord(report.archive);
+  const compact = asRecord(report.compact);
+  const vacuum = asRecord(report.vacuum);
+  const logs = asRecord(report.logs);
+  const checkpoint = asRecord(report.checkpoint);
+
+  printArchiveApplySummary(archive);
+  printCompactApplySummary(compact);
+  printVacuumSummary("State vacuum", vacuum);
+  printLogsApplySummary(logs);
+  if (Object.keys(checkpoint).length) printWalCheckpoint(checkpoint);
+}
+
+function printArchiveApplySummary(report: Record<string, unknown>): void {
+  if (!Object.keys(report).length) return;
+  const before = asRecord(report.before);
+  const after = asRecord(report.after);
+  const appServer = asRecord(report.appServerResult);
+  console.log("\nArchive apply:");
+  console.log(
+    `  archive calls: requested=${String(report.requestedArchiveCalls ?? 0)} succeeded=${String(
+      appServer.succeeded ?? 0,
+    )} failed=${String(appServer.failed ?? 0)}`,
+  );
+  console.log(`  stale rows: before=${String(before.rows ?? 0)} after=${String(after.rows ?? 0)}`);
+  if (Number(appServer.failed ?? 0) > 0) {
+    const errors = Array.isArray(appServer.errors) ? appServer.errors.slice(0, 5) : [];
+    for (const error of errors) {
+      const row = asRecord(error);
+      console.log(`  error: ${String(row.threadId)} ${String(row.error)}`);
+    }
+  }
+  if (report.backupPath) console.log(`  backup: ${String(report.backupPath)}`);
+}
+
+function printCompactApplySummary(report: Record<string, unknown>): void {
+  if (!Object.keys(report).length) return;
+  const before = asRecord(report.before);
+  const after = asRecord(report.after);
+  console.log("\nCompact apply:");
+  console.log(`  changed rows: ${String(report.changedRows ?? 0)}`);
+  console.log(`  candidates: before=${String(before.rows ?? 0)} after=${String(after.rows ?? 0)}`);
+  console.log(`  estimated payload reduction: ${String(before.estimated_savings_mib ?? 0)} MiB`);
+  if (report.backupPath) console.log(`  backup: ${String(report.backupPath)}`);
+}
+
+function printVacuumSummary(title: string, report: Record<string, unknown>): void {
+  if (!Object.keys(report).length) return;
+  const before = asRecord(report.before);
+  const after = asRecord(report.after);
+  const beforeMain = asRecord(before.main);
+  const afterMain = asRecord(after.main);
+  const beforeSpace = asRecord(report.beforeSpace);
+  const afterSpace = asRecord(report.afterSpace);
+  console.log(`\n${title}:`);
+  console.log(`  main file: ${String(beforeMain.mib ?? 0)} MiB -> ${String(afterMain.mib ?? 0)} MiB`);
+  console.log(`  freelist: ${String(beforeSpace.free_mib ?? 0)} MiB -> ${String(afterSpace.free_mib ?? 0)} MiB`);
+  if (report.backupPath) console.log(`  backup: ${String(report.backupPath)}`);
+}
+
+function printLogsApplySummary(report: Record<string, unknown>): void {
+  if (!Object.keys(report).length) return;
+  const before = asRecord(report.before);
+  const after = asRecord(report.after);
+  const beforeFiles = asRecord(report.beforeFiles);
+  const afterFiles = asRecord(report.afterFiles);
+  const beforeMain = asRecord(beforeFiles.main);
+  const afterMain = asRecord(afterFiles.main);
+  const beforeSpace = asRecord(report.beforeSpace);
+  const afterSpace = asRecord(report.afterSpace);
+  console.log("\nLogs cleanup:");
+  console.log(`  deleted rows: ${String(report.deletedRows ?? 0)}`);
+  console.log(`  capped rows: ${String(report.cappedRows ?? 0)}`);
+  console.log(`  remaining cleanup candidates: delete=${String(after.delete_rows ?? 0)} cap=${String(after.cap_rows ?? 0)}`);
+  console.log(
+    `  estimated savings before apply: delete=${String(before.delete_estimated_payload_mib ?? 0)} MiB cap=${String(
+      before.cap_estimated_savings_mib ?? 0,
+    )} MiB`,
+  );
+  console.log(`  logs file: ${String(beforeMain.mib ?? 0)} MiB -> ${String(afterMain.mib ?? 0)} MiB`);
+  console.log(`  logs freelist: ${String(beforeSpace.free_mib ?? 0)} MiB -> ${String(afterSpace.free_mib ?? 0)} MiB`);
+  if (report.backupPath) console.log(`  backup: ${String(report.backupPath)}`);
+}
+
 function printWalCheckpoint(report: Record<string, unknown>): void {
   const before = asRecord(report.before);
   const after = asRecord(report.after);
+  const beforeWal = asRecord(before.wal);
+  const afterWal = asRecord(after.wal);
   console.log("\nWAL checkpoint:");
-  console.log(`  before: ${JSON.stringify(before)}`);
-  console.log(`  after: ${JSON.stringify(after)}`);
+  console.log(`  wal: ${String(beforeWal.mib ?? 0)} MiB -> ${String(afterWal.mib ?? 0)} MiB`);
   console.log(`  checkpointResult: ${JSON.stringify(report.checkpointResult)}`);
+}
+
+function printDatabaseSpace(value: unknown): void {
+  const databases = asRecord(value);
+  if (!Object.keys(databases).length) return;
+  console.log("\nSQLite space:");
+  for (const [name, stats] of Object.entries(databases)) {
+    const record = asRecord(stats);
+    console.log(
+      `  ${name}: total=${String(record.total_mib ?? 0)} MiB used=${String(record.used_mib ?? 0)} MiB free=${String(
+        record.free_mib ?? 0,
+      )} MiB`,
+    );
+  }
 }
 
 function printObject(title: string, value: unknown, keys?: string[]): void {
@@ -1274,5 +1717,21 @@ function printArchiveCandidate(title: string, value: unknown): void {
           : JSON.stringify(object[key]);
       console.log(`  ${key}: ${value}`);
     }
+  }
+}
+
+function printLogCleanupCandidate(title: string, value: unknown): void {
+  const object = asRecord(value);
+  if (!Object.keys(object).length) return;
+  console.log(`\n${title}:`);
+  for (const key of [
+    "rows",
+    "delete_rows",
+    "delete_estimated_payload_mib",
+    "cap_rows",
+    "cap_estimated_savings_mib",
+    "cutoffUtc",
+  ]) {
+    if (object[key] !== undefined) console.log(`  ${key}: ${JSON.stringify(object[key])}`);
   }
 }

@@ -8,13 +8,18 @@ export type CleanerOptions = {
   backupDir?: string;
   codexCommand?: string;
   codexHome?: string;
+  compactRecentMetadata: boolean;
   confirmArchiveStale: boolean;
   confirmLossyMetadata: boolean;
+  confirmPruneLogs: boolean;
   includeLogs: boolean;
   includeRollouts: boolean;
   json: boolean;
+  keepLogDays: number;
   keepRecentDays: number;
+  maxLogBodyChars: number;
   maxChars: number;
+  pruneLogs: boolean;
 };
 
 export type BlockingProcess = {
