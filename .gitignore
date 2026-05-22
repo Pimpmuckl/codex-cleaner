@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+
+# build/test output
+coverage/
+dist/
+*.tsbuildinfo
+
+# local runtime output
+.codex-cleanup-backups/
+*.log
+
+# package artifacts
+*.tgz
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
