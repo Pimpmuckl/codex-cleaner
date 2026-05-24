@@ -19,6 +19,7 @@ import {
   resolveCodexSpawnCommand,
   rolloutThreadId,
   scanBackups,
+  scheduleBackupPrune,
   truncateFileToTail,
 } from "../src/cleaner.js";
 import type { CleanerOptions } from "../src/types.js";
@@ -312,19 +313,28 @@ describe("TUI log cleanup", () => {
 });
 
 describe("backup pruning", () => {
+  test("rejects scheduled prune timings that cannot delete backups", async () => {
+    await expect(scheduleBackupPrune(defaultOptions({ afterHours: 1, olderThanHours: 48 }))).rejects.toThrow(
+      "--after-hours must be greater than or equal to --older-than-hours",
+    );
+  });
+
   test("dry-runs and deletes only old codex-cleaner backup files", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
     const backupDir = path.join(dir, ".codex-cleanup-backups");
     try {
       fs.mkdirSync(backupDir, { recursive: true });
       const oldBackup = path.join(backupDir, "state_5.sqlite.20260522T214125_123Z.bak.sqlite");
+      const oldManifest = path.join(backupDir, "orphan-rollouts.20260522T214125_123Z.manifest.bak");
       const newBackup = path.join(backupDir, "codex-tui.log.20260522T214125_123Z.bak");
       const ignored = path.join(backupDir, "notes.txt");
       fs.writeFileSync(oldBackup, "old backup");
+      fs.writeFileSync(oldManifest, "old manifest");
       fs.writeFileSync(newBackup, "new backup");
       fs.writeFileSync(ignored, "not ours");
       const oldDate = new Date(Date.now() - 50 * 60 * 60 * 1000);
       fs.utimesSync(oldBackup, oldDate, oldDate);
+      fs.utimesSync(oldManifest, oldDate, oldDate);
 
       const scan = scanBackups(
         defaultOptions({
@@ -333,8 +343,8 @@ describe("backup pruning", () => {
         }),
       );
 
-      expect((scan.files as Record<string, unknown>).count).toBe(2);
-      expect((scan.pruneCandidates as Record<string, unknown>).count).toBe(1);
+      expect((scan.files as Record<string, unknown>).count).toBe(3);
+      expect((scan.pruneCandidates as Record<string, unknown>).count).toBe(2);
 
       const report = pruneBackups(
         defaultOptions({
@@ -345,8 +355,9 @@ describe("backup pruning", () => {
         }),
       );
 
-      expect((report.deleted as Record<string, unknown>).count).toBe(1);
+      expect((report.deleted as Record<string, unknown>).count).toBe(2);
       expect(fs.existsSync(oldBackup)).toBe(false);
+      expect(fs.existsSync(oldManifest)).toBe(false);
       expect(fs.existsSync(newBackup)).toBe(true);
       expect(fs.existsSync(ignored)).toBe(true);
     } finally {

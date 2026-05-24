@@ -14,7 +14,7 @@ const THREAD_COLUMNS_TO_CAP = ["title", "preview", "first_user_message"] as cons
 const APP_SERVER_REQUEST_TIMEOUT_MS = 60_000;
 const APP_SERVER_WINDOWS_TERMINATE_DELAY_MS = 1000;
 const APP_SERVER_SHUTDOWN_TIMEOUT_MS = 3000;
-const BACKUP_FILE_SUFFIXES = [".bak", ".bak.sqlite"] as const;
+const BACKUP_FILE_SUFFIXES = [".manifest.bak", ".bak.sqlite", ".bak"] as const;
 const STATE_VACUUM_MIN_FREE_MIB = 1;
 const TUI_LOG_COPY_CHUNK_BYTES = 8 * 1024 * 1024;
 const WINDOWS_BATCH_EXTENSIONS = new Set([".bat", ".cmd"]);
@@ -1019,6 +1019,9 @@ export async function scheduleBackupPrune(options: CleanerOptions): Promise<Reco
   if (options.apply && !options.confirmScheduleBackupPrune) {
     throw new Error("--apply requires --confirm-schedule-backup-prune");
   }
+  if (options.afterHours < options.olderThanHours) {
+    throw new Error("--after-hours must be greater than or equal to --older-than-hours");
+  }
 
   const codexHome = resolveCodexHome(options);
   const backupDir = resolveBackupDir(options, codexHome);
@@ -1810,9 +1813,10 @@ function buildBackupPruneCommand(
   backupDir: string,
   olderThanHours: number,
 ): { args: string[]; command: string } {
-  return {
+  const npxCommand = {
     args: [
-      currentCliPath(),
+      "--yes",
+      "codex-cleaner@latest",
       "backups",
       "prune",
       "--codex-home",
@@ -1824,13 +1828,11 @@ function buildBackupPruneCommand(
       "--apply",
       "--confirm-delete-backups",
     ],
-    command: process.execPath,
+    command: "npx",
   };
-}
-
-function currentCliPath(): string {
-  if (!process.argv[1]) throw new Error("Cannot schedule backup cleanup: current CLI path is unavailable.");
-  return path.resolve(process.argv[1]);
+  return process.platform === "win32"
+    ? { args: ["/d", "/s", "/c", windowsCommandLine(npxCommand)], command: "cmd.exe" }
+    : npxCommand;
 }
 
 function posixCommandLine(command: { args: string[]; command: string }): string {
