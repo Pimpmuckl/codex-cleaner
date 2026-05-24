@@ -536,7 +536,7 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
     }
 
     if (options.apply && Number(before.rows) > 0) {
-      backupPath = await backupSqliteDatabase(stateDb, resolveBackupDir(options, codexHome));
+      backupPath = await backupOpenSqliteDatabase(db, stateDb, resolveBackupDir(options, codexHome));
       const where = compactWhere({
         archivedOnly: options.archivedOnly,
         cutoffMs,
@@ -880,7 +880,7 @@ export async function cleanLogs(options: CleanerOptions): Promise<Record<string,
     const hasRowChanges = Number(before.cap_rows) > 0 || Number(before.delete_rows) > 0;
     const shouldVacuum = Number(beforeSpace.freelist_count) > 0 || hasRowChanges;
     if (options.apply && shouldVacuum) {
-      backupPath = await backupSqliteDatabase(logsDb, resolveBackupDir(options, codexHome));
+      backupPath = await backupOpenSqliteDatabase(db, logsDb, resolveBackupDir(options, codexHome));
       const cutoffSeconds = logCutoffSeconds(options.keepLogDays);
       if (hasRowChanges) {
         runTransaction(db, () => {
@@ -1613,14 +1613,18 @@ function backupFileStats(files: BackupFile[]): Record<string, unknown> {
 }
 
 async function backupSqliteDatabase(dbPath: string, backupDir: string): Promise<string> {
-  fs.mkdirSync(backupDir, { recursive: true });
-  const backupPath = nextBackupPath(dbPath, backupDir);
   const db = openWritableDb(dbPath);
   try {
-    await sqliteBackup(db, backupPath);
+    return await backupOpenSqliteDatabase(db, dbPath, backupDir);
   } finally {
     db.close();
   }
+}
+
+async function backupOpenSqliteDatabase(db: DatabaseSync, dbPath: string, backupDir: string): Promise<string> {
+  fs.mkdirSync(backupDir, { recursive: true });
+  const backupPath = nextBackupPath(dbPath, backupDir);
+  await sqliteBackup(db, backupPath);
   return backupPath;
 }
 
@@ -1646,7 +1650,7 @@ async function vacuumSqliteDatabase(args: {
     const beforeSpace = collectSqliteSpaceStats(db);
     if (args.apply && Number(beforeSpace.freelist_count) > 0) {
       if (args.backupBeforeVacuum) {
-        backupPath = await backupSqliteDatabase(args.dbPath, args.backupDir);
+        backupPath = await backupOpenSqliteDatabase(db, args.dbPath, args.backupDir);
       }
       db.exec("VACUUM");
       queryAll(db, "PRAGMA wal_checkpoint(TRUNCATE)");
