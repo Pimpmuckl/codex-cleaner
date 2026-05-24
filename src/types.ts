@@ -1,7 +1,18 @@
-export type CleanerCommand = "scan" | "clean" | "compact-metadata" | "checkpoint-wal";
+export type BackupCommand = "scan" | "prune" | "schedule-prune";
+
+export type CleanerCommand =
+  | "scan"
+  | "clean"
+  | "compact-metadata"
+  | "checkpoint-wal"
+  | "archive-orphan-rollouts"
+  | "backups";
 
 export type CleanerOptions = {
+  allowRunningOrphanRolloutArchive: boolean;
   allowRunningReadonly: boolean;
+  afterHours: number;
+  archiveOrphanRollouts: boolean;
   archiveStale: boolean;
   apply: boolean;
   archivedOnly: boolean;
@@ -10,16 +21,23 @@ export type CleanerOptions = {
   codexHome?: string;
   compactRecentMetadata: boolean;
   confirmArchiveStale: boolean;
+  confirmArchiveOrphanRollouts: boolean;
+  confirmDeleteBackups: boolean;
   confirmLossyMetadata: boolean;
   confirmPruneLogs: boolean;
+  confirmPruneTuiLog: boolean;
+  confirmScheduleBackupPrune: boolean;
   includeLogs: boolean;
   includeRollouts: boolean;
   json: boolean;
   keepLogDays: number;
   keepRecentDays: number;
+  keepTuiLogMib: number;
   maxLogBodyChars: number;
   maxChars: number;
+  olderThanHours: number;
   pruneLogs: boolean;
+  pruneTuiLog: boolean;
 };
 
 export type BlockingProcess = {

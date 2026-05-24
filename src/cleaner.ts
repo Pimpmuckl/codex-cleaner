@@ -1,4 +1,4 @@
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFile, spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -14,11 +14,40 @@ const THREAD_COLUMNS_TO_CAP = ["title", "preview", "first_user_message"] as cons
 const APP_SERVER_REQUEST_TIMEOUT_MS = 60_000;
 const APP_SERVER_WINDOWS_TERMINATE_DELAY_MS = 1000;
 const APP_SERVER_SHUTDOWN_TIMEOUT_MS = 3000;
+const BACKUP_FILE_SUFFIXES = [".bak", ".bak.sqlite"] as const;
+const STATE_VACUUM_MIN_FREE_MIB = 1;
+const TUI_LOG_COPY_CHUNK_BYTES = 8 * 1024 * 1024;
 const WINDOWS_BATCH_EXTENSIONS = new Set([".bat", ".cmd"]);
 
 type CodexSpawnCommand = {
   args: string[];
   command: string;
+};
+
+type BackupFile = {
+  ageHours: number;
+  bytes: number;
+  lastModified: string;
+  mib: number;
+  name: string;
+  path: string;
+};
+
+type OrphanRolloutMove = {
+  destination: string;
+  indexed: boolean;
+  modifiedMs: number;
+  path: string;
+  reason?: string;
+  sizeBytes: number;
+  threadId: string | null;
+};
+
+type OrphanRolloutPlan = {
+  candidates: OrphanRolloutMove[];
+  emptyDirs: string[];
+  skipped: OrphanRolloutMove[];
+  stats: Record<string, unknown>;
 };
 
 export async function requireStoppedOrReadonlyAllowed(args: {
@@ -361,9 +390,11 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
     codexHome,
     generatedAt: new Date().toISOString(),
     policy: {
+      archiveOrphanRollouts: options.archiveOrphanRollouts,
       compactRecentMetadata: options.compactRecentMetadata,
       keepLogDays: options.keepLogDays,
       keepRecentDays: options.keepRecentDays,
+      keepTuiLogMib: options.keepTuiLogMib,
       maxLogBodyChars: options.maxLogBodyChars,
       maxChars: options.maxChars,
       recentCutoffMs: cutoffMs,
@@ -413,6 +444,9 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
         statRollouts: options.includeRollouts,
       });
     }
+    if (options.archiveOrphanRollouts) {
+      report.orphanRolloutArchiveCandidates = collectOrphanRolloutArchiveStats(db, codexHome, { cutoffMs });
+    }
     report.recentSample = queryAll(
       db,
       `
@@ -443,6 +477,13 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
     }
   }
 
+  if (options.pruneTuiLog) {
+    report.tuiLogCleanupCandidates = collectTuiLogCleanupStats(
+      path.join(codexHome, "log", "codex-tui.log"),
+      options.keepTuiLogMib,
+    );
+  }
+
   if (options.includeRollouts) {
     const rolloutDb = openReadonlyDb(stateDb);
     try {
@@ -456,10 +497,6 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
 }
 
 export async function compactMetadata(options: CleanerOptions): Promise<Record<string, unknown>> {
-  if (options.apply && !options.confirmLossyMetadata) {
-    throw new Error("--apply requires --confirm-lossy-metadata");
-  }
-
   const codexHome = resolveCodexHome(options);
   const stateDb = path.join(codexHome, "state_5.sqlite");
   const globalState = loadGlobalState(codexHome);
@@ -478,6 +515,10 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
       protectRecent: !options.compactRecentMetadata,
       protectedIds,
     });
+
+    if (options.apply && Number(before.rows) > 0 && !options.confirmLossyMetadata) {
+      throw new Error("--apply requires --confirm-lossy-metadata");
+    }
 
     if (options.apply && Number(before.rows) > 0) {
       backupPath = await backupSqliteDatabase(
@@ -533,17 +574,25 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
 }
 
 export async function cleanCodex(options: CleanerOptions): Promise<Record<string, unknown>> {
-  if (options.apply && !options.confirmLossyMetadata) {
-    throw new Error("--apply requires --confirm-lossy-metadata");
-  }
   if (options.apply && options.archiveStale && !options.confirmArchiveStale) {
     throw new Error("--apply with stale archiving requires --confirm-archive-stale");
+  }
+  if (options.apply && options.archiveOrphanRollouts && !options.confirmArchiveOrphanRollouts) {
+    throw new Error("--apply with orphan rollout archiving requires --confirm-archive-orphan-rollouts");
   }
   if (options.apply && options.pruneLogs && !options.confirmPruneLogs) {
     throw new Error("--apply with log cleanup requires --confirm-prune-logs");
   }
+  if (options.apply && options.pruneTuiLog && !options.confirmPruneTuiLog) {
+    throw new Error("--apply with TUI log cleanup requires --confirm-prune-tui-log");
+  }
 
   const scan = buildScanReport({ ...options, apply: false });
+  const compactCandidateRows = Number(asRecord(scan.compactMetadataCandidates).rows ?? 0);
+  if (options.apply && compactCandidateRows > 0 && !options.confirmLossyMetadata) {
+    throw new Error("--apply requires --confirm-lossy-metadata");
+  }
+
   if (!options.apply) {
     return {
       action: "clean",
@@ -553,10 +602,17 @@ export async function cleanCodex(options: CleanerOptions): Promise<Record<string
   }
 
   const archive = options.archiveStale ? await archiveStaleThreads(options) : null;
+  const orphanRollouts = options.archiveOrphanRollouts ? archiveOrphanRollouts(options) : null;
   const compact = await compactMetadata(options);
   const hasStateBackup = Boolean(asRecord(archive).backupPath || asRecord(compact).backupPath);
-  const vacuum = await vacuumStateDatabase(options, !hasStateBackup);
+  const stateSpace = asRecord(asRecord(scan.databaseSpace)["state_5.sqlite"]);
+  const shouldVacuumState =
+    Boolean(asRecord(archive).backupPath) ||
+    Number(asRecord(compact).changedRows ?? 0) > 0 ||
+    Number(stateSpace.free_mib ?? 0) >= STATE_VACUUM_MIN_FREE_MIB;
+  const vacuum = shouldVacuumState ? await vacuumStateDatabase(options, !hasStateBackup) : null;
   const logs = options.pruneLogs ? await cleanLogs(options) : null;
+  const tuiLog = options.pruneTuiLog ? await cleanTuiLog(options) : null;
   const checkpoint = await checkpointWal(options);
 
   return {
@@ -567,9 +623,11 @@ export async function cleanCodex(options: CleanerOptions): Promise<Record<string
     policy: scan.policy,
     scan,
     archive,
+    orphanRollouts,
     compact,
     vacuum,
     logs,
+    tuiLog,
     checkpoint,
   };
 }
@@ -632,6 +690,110 @@ export async function archiveStaleThreads(options: CleanerOptions): Promise<Reco
     requestedArchiveCalls: beforePlan.archiveCallIds.length,
     appServerResult,
     backupPath,
+  };
+}
+
+export function archiveOrphanRollouts(options: CleanerOptions): Record<string, unknown> {
+  if (options.apply && !options.confirmArchiveOrphanRollouts) {
+    throw new Error("--apply requires --confirm-archive-orphan-rollouts");
+  }
+
+  const codexHome = resolveCodexHome(options);
+  const stateDb = path.join(codexHome, "state_5.sqlite");
+  const cutoffMs = recentCutoffMs(options.keepRecentDays);
+  const beforeDb = openReadonlyDb(stateDb);
+  let beforePlan: OrphanRolloutPlan;
+  try {
+    beforePlan = buildOrphanRolloutPlan(beforeDb, codexHome, { cutoffMs });
+  } finally {
+    beforeDb.close();
+  }
+
+  let manifestPath: string | null = null;
+  const moved: OrphanRolloutMove[] = [];
+  const errors: Record<string, unknown>[] = [];
+  let prunedEmptyDirs: string[] = [];
+
+  if (options.apply && beforePlan.candidates.length) {
+    const backupDir = resolveBackupDir(options, codexHome);
+    manifestPath = nextOrphanRolloutManifestPath(backupDir);
+    fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+    writeJsonFile(manifestPath, {
+      action: "archive-orphan-rollouts",
+      generatedAt: new Date().toISOString(),
+      codexHome,
+      policy: {
+        keepRecentDays: options.keepRecentDays,
+        recentCutoffMs: cutoffMs,
+        recentCutoffUtc: millisToIso(cutoffMs),
+      },
+      candidates: beforePlan.candidates,
+    });
+
+    fs.mkdirSync(path.join(codexHome, "archived_sessions"), { recursive: true });
+    for (const move of beforePlan.candidates) {
+      try {
+        assertSafeRolloutMove(codexHome, move.path, move.destination);
+        if (fs.existsSync(move.destination)) {
+          errors.push({ error: "destination exists", path: move.path, destination: move.destination });
+          continue;
+        }
+        fs.renameSync(move.path, move.destination);
+        moved.push(move);
+      } catch (error) {
+        errors.push({
+          error: error instanceof Error ? error.message : String(error),
+          path: move.path,
+          destination: move.destination,
+        });
+      }
+    }
+    prunedEmptyDirs = [
+      ...pruneEmptyDirectories(path.join(codexHome, "sessions")),
+      ...pruneEmptyDirectories(path.join(codexHome, "archived_sessions")),
+    ];
+    writeJsonFile(manifestPath, {
+      action: "archive-orphan-rollouts",
+      generatedAt: new Date().toISOString(),
+      codexHome,
+      policy: {
+        keepRecentDays: options.keepRecentDays,
+        recentCutoffMs: cutoffMs,
+        recentCutoffUtc: millisToIso(cutoffMs),
+      },
+      moved,
+      skipped: beforePlan.skipped,
+      prunedEmptyDirs,
+      errors,
+    });
+  }
+
+  const afterDb = openReadonlyDb(stateDb);
+  let afterPlan: OrphanRolloutPlan;
+  try {
+    afterPlan = buildOrphanRolloutPlan(afterDb, codexHome, { cutoffMs });
+  } finally {
+    afterDb.close();
+  }
+
+  return {
+    action: "archive-orphan-rollouts",
+    mode: options.apply ? "apply" : "dry-run",
+    codexHome,
+    generatedAt: new Date().toISOString(),
+    policy: {
+      keepRecentDays: options.keepRecentDays,
+      recentCutoffMs: cutoffMs,
+      recentCutoffUtc: millisToIso(cutoffMs),
+    },
+    before: beforePlan.stats,
+    after: afterPlan.stats,
+    movedFiles: moved.length,
+    movedMib: fileMoveListSizeMib(moved),
+    prunedEmptyDirs: prunedEmptyDirs.length,
+    prunedEmptyDirSample: prunedEmptyDirs.slice(0, 10),
+    errors: errors.slice(0, 10),
+    manifestPath,
   };
 }
 
@@ -746,8 +908,8 @@ export async function cleanLogs(options: CleanerOptions): Promise<Record<string,
       policy: {
         keepLogDays: options.keepLogDays,
         maxLogBodyChars: options.maxLogBodyChars,
-      cutoffSeconds: logCutoffSeconds(options.keepLogDays),
-      cutoffUtc: secondsToIso(logCutoffSeconds(options.keepLogDays)),
+        cutoffSeconds: logCutoffSeconds(options.keepLogDays),
+        cutoffUtc: secondsToIso(logCutoffSeconds(options.keepLogDays)),
       },
       beforeFiles,
       afterFiles: fileTripletSizes(logsDb),
@@ -762,6 +924,130 @@ export async function cleanLogs(options: CleanerOptions): Promise<Record<string,
   } finally {
     db.close();
   }
+}
+
+export async function cleanTuiLog(options: CleanerOptions): Promise<Record<string, unknown>> {
+  if (options.apply && !options.confirmPruneTuiLog) {
+    throw new Error("--apply requires --confirm-prune-tui-log");
+  }
+
+  const codexHome = resolveCodexHome(options);
+  const logPath = path.join(codexHome, "log", "codex-tui.log");
+  const before = collectTuiLogCleanupStats(logPath, options.keepTuiLogMib);
+  let backupPath: string | null = null;
+  let truncatedBytes = 0;
+
+  if (options.apply && before.exists && Number(before.reclaimable_bytes) > 0) {
+    backupPath = backupRegularFile(logPath, options.backupDir ?? path.join(codexHome, ".codex-cleanup-backups"));
+    truncateFileToTail(logPath, Number(before.keep_bytes));
+    truncatedBytes = Number(before.reclaimable_bytes);
+  }
+
+  return {
+    action: "clean-tui-log",
+    mode: options.apply ? "apply" : "dry-run",
+    codexHome,
+    generatedAt: new Date().toISOString(),
+    policy: {
+      keepTuiLogMib: options.keepTuiLogMib,
+    },
+    before,
+    after: collectTuiLogCleanupStats(logPath, options.keepTuiLogMib),
+    truncatedBytes,
+    truncatedMib: roundMib(truncatedBytes),
+    backupPath,
+  };
+}
+
+export function scanBackups(options: CleanerOptions): Record<string, unknown> {
+  const codexHome = resolveCodexHome(options);
+  const backupDir = resolveBackupDir(options, codexHome);
+  const cutoffMs = Date.now() - options.olderThanHours * 60 * 60 * 1000;
+  const files = listBackupFiles(backupDir);
+  const candidates = files.filter((file) => Date.parse(file.lastModified) < cutoffMs);
+
+  return {
+    action: "backups-scan",
+    mode: "dry-run",
+    codexHome,
+    generatedAt: new Date().toISOString(),
+    policy: {
+      olderThanHours: options.olderThanHours,
+      cutoffMs,
+      cutoffUtc: millisToIso(cutoffMs),
+    },
+    backupDir,
+    files: backupFileStats(files),
+    pruneCandidates: backupFileStats(candidates),
+    sample: candidates.slice(0, 10),
+  };
+}
+
+export function pruneBackups(options: CleanerOptions): Record<string, unknown> {
+  if (options.apply && !options.confirmDeleteBackups) {
+    throw new Error("--apply requires --confirm-delete-backups");
+  }
+
+  const before = scanBackups(options);
+  const candidates = backupFilesFromReport(before.pruneCandidates);
+  const deleted: BackupFile[] = [];
+  if (options.apply) {
+    const backupDir = String(before.backupDir);
+    for (const file of candidates) {
+      const resolved = path.resolve(file.path);
+      if (path.dirname(resolved) !== backupDir) {
+        throw new Error(`Refusing to delete backup outside backup dir: ${file.path}`);
+      }
+      fs.unlinkSync(resolved);
+      deleted.push(file);
+    }
+  }
+
+  const after = scanBackups(options);
+  return {
+    action: "backups-prune",
+    mode: options.apply ? "apply" : "dry-run",
+    codexHome: before.codexHome,
+    generatedAt: new Date().toISOString(),
+    policy: before.policy,
+    backupDir: before.backupDir,
+    before: before.files,
+    candidates: before.pruneCandidates,
+    after: after.files,
+    deleted: backupFileStats(deleted),
+  };
+}
+
+export async function scheduleBackupPrune(options: CleanerOptions): Promise<Record<string, unknown>> {
+  if (options.apply && !options.confirmScheduleBackupPrune) {
+    throw new Error("--apply requires --confirm-schedule-backup-prune");
+  }
+
+  const codexHome = resolveCodexHome(options);
+  const backupDir = resolveBackupDir(options, codexHome);
+  const runAt = new Date(Date.now() + options.afterHours * 60 * 60 * 1000);
+  const scheduled = await schedulePruneCommand({
+    afterHours: options.afterHours,
+    apply: options.apply,
+    backupDir,
+    codexHome,
+    olderThanHours: options.olderThanHours,
+    runAt,
+  });
+
+  return {
+    action: "backups-schedule-prune",
+    mode: options.apply ? "apply" : "dry-run",
+    codexHome,
+    generatedAt: new Date().toISOString(),
+    policy: {
+      afterHours: options.afterHours,
+      olderThanHours: options.olderThanHours,
+      runAtUtc: runAt.toISOString(),
+    },
+    backupDir,
+    ...scheduled,
+  };
 }
 
 export function compactWhere(args: {
@@ -1079,25 +1365,135 @@ export function collectLogCleanupStats(db: Database.Database, options: CleanerOp
   };
 }
 
+export function collectTuiLogCleanupStats(logPath: string, keepMib: number): Record<string, unknown> {
+  const size = fileSize(logPath);
+  const currentBytes = Number(size.bytes ?? 0);
+  const keepBytes = keepMib * 1024 * 1024;
+  const reclaimableBytes = Math.max(0, currentBytes - keepBytes);
+  return {
+    current_bytes: currentBytes,
+    current_mib: roundMib(currentBytes),
+    exists: Boolean(size.exists),
+    keep_bytes: keepBytes,
+    keep_mib: keepMib,
+    path: logPath,
+    reclaimable_bytes: reclaimableBytes,
+    reclaimable_mib: roundMib(reclaimableBytes),
+    target_mib: roundMib(currentBytes - reclaimableBytes),
+  };
+}
+
+export function collectOrphanRolloutArchiveStats(
+  db: Database.Database,
+  codexHome: string,
+  args: { cutoffMs: number },
+): Record<string, unknown> {
+  return buildOrphanRolloutPlan(db, codexHome, args).stats;
+}
+
+function buildOrphanRolloutPlan(
+  db: Database.Database,
+  codexHome: string,
+  args: { cutoffMs: number },
+): OrphanRolloutPlan {
+  const refs = queryAll(
+    db,
+    "SELECT rollout_path FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != ''",
+  );
+  const referencedPaths = new Set(refs.map((row) => normalizePath(String(row.rollout_path))));
+  const sessionFiles = listRolloutFiles(path.join(codexHome, "sessions"));
+  const sessionIndexIds = loadSessionIndexIds(codexHome);
+  const archivedRoot = path.join(codexHome, "archived_sessions");
+  const sessionsRoot = path.join(codexHome, "sessions");
+  const candidates: OrphanRolloutMove[] = [];
+  const skipped: OrphanRolloutMove[] = [];
+
+  for (const file of sessionFiles) {
+    if (referencedPaths.has(normalizePath(file))) continue;
+    const stat = fs.statSync(file);
+    const threadId = rolloutThreadId(file);
+    const move: OrphanRolloutMove = {
+      destination: path.join(archivedRoot, path.basename(file)),
+      indexed: sessionIndexIds.has(threadId ?? ""),
+      modifiedMs: stat.mtimeMs,
+      path: file,
+      sizeBytes: stat.size,
+      threadId,
+    };
+    if (stat.mtimeMs >= args.cutoffMs) {
+      skipped.push({ ...move, reason: "recent" });
+      continue;
+    }
+    if (fs.existsSync(move.destination)) {
+      skipped.push({ ...move, reason: "destination-exists" });
+      continue;
+    }
+    candidates.push(move);
+  }
+
+  const candidatePaths = new Set(candidates.map((move) => normalizePath(move.path)));
+  const emptyDirs = [
+    ...collectEmptyDirectories(sessionsRoot, candidatePaths),
+    ...collectEmptyDirectories(archivedRoot),
+  ];
+  const indexed = candidates.filter((move) => move.indexed);
+  const unindexed = candidates.filter((move) => !move.indexed);
+  const modifiedValues = candidates.map((move) => move.modifiedMs);
+  return {
+    candidates,
+    emptyDirs,
+    skipped,
+    stats: {
+      empty_dir_candidates: emptyDirs.length,
+      empty_dir_sample: emptyDirs.slice(0, 10),
+      rows: candidates.length,
+      files: candidates.length,
+      size_mib: fileMoveListSizeMib(candidates),
+      indexed_files: indexed.length,
+      indexed_size_mib: fileMoveListSizeMib(indexed),
+      unindexed_files: unindexed.length,
+      unindexed_size_mib: fileMoveListSizeMib(unindexed),
+      skipped_files: skipped.length,
+      skipped_recent_files: skipped.filter((move) => move.reason === "recent").length,
+      skipped_destination_exists_files: skipped.filter((move) => move.reason === "destination-exists").length,
+      oldest_candidate_modified_utc: millisToIso(minNumberOrNull(modifiedValues)),
+      newest_candidate_modified_utc: millisToIso(maxNumberOrNull(modifiedValues)),
+      sample: topMoveSample(candidates),
+    },
+  };
+}
+
 function collectRolloutLinkage(db: Database.Database, codexHome: string): Record<string, unknown> {
   const refs = queryAll(
     db,
-    "SELECT id, rollout_path FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != ''",
+    "SELECT id, archived, rollout_path FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != ''",
   );
   const referencedPaths = new Set(refs.map((row) => normalizePath(String(row.rollout_path))));
-  const diskFiles = [
-    ...listRolloutFiles(path.join(codexHome, "sessions")),
-    ...listRolloutFiles(path.join(codexHome, "archived_sessions")),
-  ];
+  const sessionFiles = listRolloutFiles(path.join(codexHome, "sessions"));
+  const archivedFiles = listRolloutFiles(path.join(codexHome, "archived_sessions"));
+  const diskFiles = [...sessionFiles, ...archivedFiles];
   const diskPaths = new Set(diskFiles.map((file) => normalizePath(file)));
   const missing = refs.filter((row) => !diskPaths.has(normalizePath(String(row.rollout_path))));
+  const missingActive = missing.filter((row) => Number(row.archived ?? 0) !== 1);
+  const missingArchived = missing.filter((row) => Number(row.archived ?? 0) === 1);
   const orphans = diskFiles.filter((file) => !referencedPaths.has(normalizePath(file)));
+  const sessionOrphans = sessionFiles.filter((file) => !referencedPaths.has(normalizePath(file)));
+  const archivedOrphans = archivedFiles.filter((file) => !referencedPaths.has(normalizePath(file)));
   const sessionIndexIds = loadSessionIndexIds(codexHome);
   const indexedOrphans = orphans.filter((file) => sessionIndexIds.has(rolloutThreadId(file) ?? ""));
   const unindexedOrphans = orphans.filter((file) => !sessionIndexIds.has(rolloutThreadId(file) ?? ""));
+  const indexedSessionOrphans = sessionOrphans.filter((file) => sessionIndexIds.has(rolloutThreadId(file) ?? ""));
+  const unindexedSessionOrphans = sessionOrphans.filter((file) => !sessionIndexIds.has(rolloutThreadId(file) ?? ""));
   return {
+    archivedOrphanFiles: archivedOrphans.length,
+    archivedOrphanSizeMib: fileListSizeMib(archivedOrphans),
+    archivedRolloutFiles: archivedFiles.length,
     diskRolloutFiles: diskFiles.length,
     missingReferencedFiles: missing.length,
+    missingActiveReferencedFiles: missingActive.length,
+    missingArchivedReferencedFiles: missingArchived.length,
+    missingActiveSample: missingActive.slice(0, 10),
+    missingArchivedSample: missingArchived.slice(0, 10),
     missingSample: missing.slice(0, 10),
     orphanFiles: orphans.length,
     orphanIndexedFiles: indexedOrphans.length,
@@ -1105,8 +1501,16 @@ function collectRolloutLinkage(db: Database.Database, codexHome: string): Record
     orphanSizeMib: fileListSizeMib(orphans),
     orphanUnindexedFiles: unindexedOrphans.length,
     orphanUnindexedSizeMib: fileListSizeMib(unindexedOrphans),
+    sessionOrphanFiles: sessionOrphans.length,
+    sessionOrphanIndexedFiles: indexedSessionOrphans.length,
+    sessionOrphanIndexedSizeMib: fileListSizeMib(indexedSessionOrphans),
+    sessionOrphanSizeMib: fileListSizeMib(sessionOrphans),
+    sessionOrphanUnindexedFiles: unindexedSessionOrphans.length,
+    sessionOrphanUnindexedSizeMib: fileListSizeMib(unindexedSessionOrphans),
+    sessionRolloutFiles: sessionFiles.length,
     threadRolloutRefs: refs.length,
     topOrphanSample: topFileSample(orphans),
+    topSessionOrphanSample: topFileSample(sessionOrphans),
     topUnindexedOrphanSample: topFileSample(unindexedOrphans),
   };
 }
@@ -1156,6 +1560,59 @@ function loadSessionIndexIds(codexHome: string): Set<string> {
   return ids;
 }
 
+function resolveBackupDir(options: CleanerOptions, codexHome: string): string {
+  return path.resolve(options.backupDir ?? path.join(codexHome, ".codex-cleanup-backups"));
+}
+
+function listBackupFiles(backupDir: string): BackupFile[] {
+  if (!fs.existsSync(backupDir)) return [];
+  const now = Date.now();
+  return fs
+    .readdirSync(backupDir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && BACKUP_FILE_SUFFIXES.some((suffix) => entry.name.endsWith(suffix)))
+    .map((entry) => {
+      const filePath = path.resolve(backupDir, entry.name);
+      const stat = fs.statSync(filePath);
+      return {
+        ageHours: Math.round(((now - stat.mtimeMs) / 60 / 60 / 1000) * 100) / 100,
+        bytes: stat.size,
+        lastModified: stat.mtime.toISOString(),
+        mib: roundMib(stat.size),
+        name: entry.name,
+        path: filePath,
+      };
+    })
+    .sort((left, right) => Date.parse(left.lastModified) - Date.parse(right.lastModified));
+}
+
+function backupFileStats(files: BackupFile[]): Record<string, unknown> {
+  const totalBytes = files.reduce((sum, file) => sum + file.bytes, 0);
+  return {
+    count: files.length,
+    files,
+    newestUtc: files.length ? files[files.length - 1]?.lastModified : null,
+    oldestUtc: files.length ? files[0]?.lastModified : null,
+    totalBytes,
+    totalMib: roundMib(totalBytes),
+  };
+}
+
+function backupFilesFromReport(value: unknown): BackupFile[] {
+  const files = asRecord(value).files;
+  if (!Array.isArray(files)) return [];
+  return files
+    .map((file) => asRecord(file))
+    .filter((file) => typeof file.path === "string")
+    .map((file) => ({
+      ageHours: Number(file.ageHours ?? 0),
+      bytes: Number(file.bytes ?? 0),
+      lastModified: String(file.lastModified ?? ""),
+      mib: Number(file.mib ?? 0),
+      name: String(file.name ?? path.basename(String(file.path))),
+      path: String(file.path),
+    }));
+}
+
 async function backupSqliteDatabase(dbPath: string, backupDir: string): Promise<string> {
   fs.mkdirSync(backupDir, { recursive: true });
   const backupPath = nextBackupPath(dbPath, backupDir);
@@ -1165,6 +1622,13 @@ async function backupSqliteDatabase(dbPath: string, backupDir: string): Promise<
   } finally {
     db.close();
   }
+  return backupPath;
+}
+
+function backupRegularFile(filePath: string, backupDir: string): string {
+  fs.mkdirSync(backupDir, { recursive: true });
+  const backupPath = nextFileBackupPath(filePath, backupDir);
+  fs.copyFileSync(filePath, backupPath);
   return backupPath;
 }
 
@@ -1217,6 +1681,227 @@ export function nextBackupPath(dbPath: string, backupDir: string, now = new Date
     suffix += 1;
   }
   return backupPath;
+}
+
+export function nextFileBackupPath(filePath: string, backupDir: string, now = new Date()): string {
+  const stamp = now
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(".", "_");
+  const base = `${path.basename(filePath)}.${stamp}`;
+  let backupPath = path.join(backupDir, `${base}.bak`);
+  let suffix = 2;
+  while (fs.existsSync(backupPath)) {
+    backupPath = path.join(backupDir, `${base}.${String(suffix)}.bak`);
+    suffix += 1;
+  }
+  return backupPath;
+}
+
+function nextOrphanRolloutManifestPath(backupDir: string, now = new Date()): string {
+  const stamp = now
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(".", "_");
+  const base = `orphan-rollouts.${stamp}.manifest`;
+  let manifestPath = path.join(backupDir, `${base}.bak`);
+  let suffix = 2;
+  while (fs.existsSync(manifestPath)) {
+    manifestPath = path.join(backupDir, `${base}.${String(suffix)}.bak`);
+    suffix += 1;
+  }
+  return manifestPath;
+}
+
+function writeJsonFile(filePath: string, value: unknown): void {
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+export function truncateFileToTail(filePath: string, keepBytes: number): void {
+  const currentBytes = fs.statSync(filePath).size;
+  if (currentBytes <= keepBytes) return;
+
+  const fd = fs.openSync(filePath, "r+");
+  try {
+    const buffer = Buffer.allocUnsafe(Math.min(TUI_LOG_COPY_CHUNK_BYTES, keepBytes));
+    let readOffset = currentBytes - keepBytes;
+    let writeOffset = 0;
+    let remaining = keepBytes;
+
+    while (remaining > 0) {
+      const wanted = Math.min(buffer.length, remaining);
+      const bytesRead = fs.readSync(fd, buffer, 0, wanted, readOffset);
+      if (bytesRead <= 0) throw new Error(`Could not read log tail from ${filePath}`);
+      fs.writeSync(fd, buffer, 0, bytesRead, writeOffset);
+      readOffset += bytesRead;
+      writeOffset += bytesRead;
+      remaining -= bytesRead;
+    }
+
+    fs.ftruncateSync(fd, keepBytes);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+async function schedulePruneCommand(args: {
+  afterHours: number;
+  apply: boolean;
+  backupDir: string;
+  codexHome: string;
+  olderThanHours: number;
+  runAt: Date;
+}): Promise<Record<string, unknown>> {
+  const command = buildBackupPruneCommand(args.codexHome, args.backupDir, args.olderThanHours);
+  const taskName = `codex-cleaner-prune-backups-${timestampForName(new Date())}`;
+
+  if (process.platform === "win32") {
+    const cancelCommand = `schtasks /Delete /TN ${quoteWindowsArgument(taskName)} /F`;
+    if (!args.apply) {
+      return {
+        cancelCommand,
+        command: windowsCommandLine(command),
+        runAtUtc: args.runAt.toISOString(),
+        scheduler: "windows-scheduled-task",
+        scheduled: false,
+        taskName,
+      };
+    }
+
+    const script = [
+      `$action = New-ScheduledTaskAction -Execute ${powershellSingleQuote(command.command)} -Argument ${powershellSingleQuote(
+        command.args.map(quoteWindowsArgument).join(" "),
+      )}`,
+      `$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddHours(${String(args.afterHours)})`,
+      `Register-ScheduledTask -TaskName ${powershellSingleQuote(taskName)} -Action $action -Trigger $trigger -Description 'Delete old codex-cleaner backups by running codex-cleaner backups prune.' -Force | Out-Null`,
+    ].join("\n");
+    const result = spawnSync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], {
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    if (result.status !== 0) {
+      throw new Error(`Failed to schedule backup cleanup: ${result.stderr || result.stdout}`);
+    }
+    return {
+      cancelCommand,
+      command: windowsCommandLine(command),
+      runAtUtc: args.runAt.toISOString(),
+      scheduler: "windows-scheduled-task",
+      scheduled: true,
+      taskName,
+    };
+  }
+
+  const shellCommand = posixCommandLine(command);
+  const atAvailable = spawnSync("sh", ["-c", "command -v at"], { encoding: "utf8" }).status === 0;
+  if (!atAvailable) {
+    throw new Error("Cannot schedule backup cleanup: POSIX `at` is not available.");
+  }
+  if (!args.apply) {
+    return {
+      cancelCommand: "Apply the schedule command to get an atrm <job-id> cancel command.",
+      command: shellCommand,
+      runAtUtc: args.runAt.toISOString(),
+      scheduler: "at",
+      scheduled: false,
+    };
+  }
+
+  const result = spawnSync("at", ["now", "+", String(args.afterHours), "hours"], {
+    encoding: "utf8",
+    input: `${shellCommand}\n`,
+  });
+  const combined = `${result.stdout}\n${result.stderr}`;
+  if (result.status !== 0) {
+    throw new Error(`Failed to schedule backup cleanup: ${combined.trim()}`);
+  }
+  const jobId = combined.match(/\bjob\s+(\d+)\b/i)?.[1];
+  if (!jobId) {
+    throw new Error(`Scheduled backup cleanup, but could not parse a cancelable at job id: ${combined.trim()}`);
+  }
+  return {
+    cancelCommand: `atrm ${jobId}`,
+    command: shellCommand,
+    jobId,
+    runAtUtc: args.runAt.toISOString(),
+    scheduler: "at",
+    scheduled: true,
+  };
+}
+
+function buildBackupPruneCommand(
+  codexHome: string,
+  backupDir: string,
+  olderThanHours: number,
+): { args: string[]; command: string } {
+  return {
+    args: [
+      currentCliPath(),
+      "backups",
+      "prune",
+      "--codex-home",
+      codexHome,
+      "--backup-dir",
+      backupDir,
+      "--older-than-hours",
+      String(olderThanHours),
+      "--apply",
+      "--confirm-delete-backups",
+    ],
+    command: process.execPath,
+  };
+}
+
+function currentCliPath(): string {
+  if (!process.argv[1]) throw new Error("Cannot schedule backup cleanup: current CLI path is unavailable.");
+  return path.resolve(process.argv[1]);
+}
+
+function posixCommandLine(command: { args: string[]; command: string }): string {
+  return [command.command, ...command.args].map(shellQuote).join(" ");
+}
+
+function windowsCommandLine(command: { args: string[]; command: string }): string {
+  return [command.command, ...command.args].map(quoteWindowsArgument).join(" ");
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function powershellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function quoteWindowsArgument(value: string): string {
+  if (!/[ \t"]/.test(value)) return value;
+  let result = '"';
+  let backslashes = 0;
+  for (const char of value) {
+    if (char === "\\") {
+      backslashes += 1;
+      continue;
+    }
+    if (char === '"') {
+      result += "\\".repeat(backslashes * 2 + 1);
+      result += '"';
+      backslashes = 0;
+      continue;
+    }
+    result += "\\".repeat(backslashes);
+    result += char;
+    backslashes = 0;
+  }
+  result += "\\".repeat(backslashes * 2);
+  result += '"';
+  return result;
+}
+
+function timestampForName(date: Date): string {
+  return date
+    .toISOString()
+    .replace(/[-:]/g, "")
+    .replace(/\.\d{3}Z$/, "Z");
 }
 
 function openReadonlyDb(file: string): Database.Database {
@@ -1311,11 +1996,67 @@ function listRolloutFiles(root: string): string[] {
   return output;
 }
 
+function collectEmptyDirectories(root: string, removedFilePaths = new Set<string>()): string[] {
+  if (!fs.existsSync(root)) return [];
+  const resolvedRoot = path.resolve(root);
+  const output: string[] = [];
+
+  const visit = (dir: string): boolean => {
+    let empty = true;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!visit(full)) empty = false;
+        continue;
+      }
+      if (entry.isFile() && removedFilePaths.has(normalizePath(full))) {
+        continue;
+      }
+      empty = false;
+    }
+    if (empty && path.resolve(dir) !== resolvedRoot) {
+      output.push(dir);
+    }
+    return empty;
+  };
+
+  visit(resolvedRoot);
+  return output;
+}
+
+function pruneEmptyDirectories(root: string): string[] {
+  const dirs = collectEmptyDirectories(root);
+  const removed: string[] = [];
+  for (const dir of dirs) {
+    try {
+      fs.rmdirSync(dir);
+      removed.push(dir);
+    } catch {
+      // Directory may have been recreated or filled by a live process.
+    }
+  }
+  return removed;
+}
+
 function topFileSample(files: string[], limit = 10): Record<string, unknown>[] {
   return [...files]
     .sort((left, right) => fs.statSync(right).size - fs.statSync(left).size)
     .slice(0, limit)
     .map((file) => ({ path: file, sizeMib: roundMib(fs.statSync(file).size), threadId: rolloutThreadId(file) }));
+}
+
+function topMoveSample(files: OrphanRolloutMove[], limit = 10): Record<string, unknown>[] {
+  return [...files]
+    .sort((left, right) => right.sizeBytes - left.sizeBytes)
+    .slice(0, limit)
+    .map((file) => ({
+      destination: file.destination,
+      indexed: file.indexed,
+      modifiedUtc: millisToIso(file.modifiedMs),
+      path: file.path,
+      sizeMib: roundMib(file.sizeBytes),
+      threadId: file.threadId,
+    }));
 }
 
 type RolloutFileInfo = {
@@ -1366,6 +2107,10 @@ function fileListSizeMib(files: string[]): number {
 }
 
 function fileInfoListSizeMib(files: RolloutFileInfo[]): number {
+  return roundMib(files.reduce((total, file) => total + file.sizeBytes, 0));
+}
+
+function fileMoveListSizeMib(files: OrphanRolloutMove[]): number {
   return roundMib(files.reduce((total, file) => total + file.sizeBytes, 0));
 }
 
@@ -1431,6 +2176,24 @@ function normalizePath(file: string): string {
   return path.resolve(withoutPrefix).toLowerCase();
 }
 
+function assertSafeRolloutMove(codexHome: string, source: string, destination: string): void {
+  const sessionsRoot = path.resolve(codexHome, "sessions");
+  const archivedRoot = path.resolve(codexHome, "archived_sessions");
+  const resolvedSource = path.resolve(source);
+  const resolvedDestination = path.resolve(destination);
+  if (!isPathInside(sessionsRoot, resolvedSource)) {
+    throw new Error(`Refusing to move rollout outside sessions: ${source}`);
+  }
+  if (path.dirname(resolvedDestination) !== archivedRoot) {
+    throw new Error(`Refusing to move rollout outside archived_sessions: ${destination}`);
+  }
+}
+
+function isPathInside(root: string, target: string): boolean {
+  const relative = path.relative(root, target);
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
@@ -1491,8 +2254,18 @@ function printHumanReport(report: Record<string, unknown>): void {
   console.log(`Generated: ${String(report.generatedAt)}`);
   if (report.policy) console.log(`Policy: ${JSON.stringify(report.policy)}`);
 
+  if (String(report.action).startsWith("backups-")) {
+    printBackupsReport(report);
+    return;
+  }
+
   if (report.action === "clean" && report.mode === "apply") {
     printCleanApplySummary(report);
+    return;
+  }
+
+  if (report.action === "archive-orphan-rollouts") {
+    printOrphanRolloutSummary(report);
     return;
   }
 
@@ -1526,7 +2299,9 @@ function printHumanReport(report: Record<string, unknown>): void {
   printCandidate("Compact candidates", report.compactMetadataCandidates);
   printCandidate("Compact candidates archived-only", report.compactMetadataCandidatesArchivedOnly);
   printArchiveCandidate("Stale archive candidates", report.staleArchiveCandidates);
+  printOrphanRolloutArchiveCandidate("Orphan rollout archive candidates", report.orphanRolloutArchiveCandidates);
   printLogCleanupCandidate("Log cleanup candidates", report.logCleanupCandidates);
+  printTuiLogCleanupCandidate("TUI log cleanup candidate", report.tuiLogCleanupCandidates);
   if (report.action === "checkpoint-wal") {
     printWalCheckpoint(report);
   } else {
@@ -1548,12 +2323,22 @@ function printHumanReport(report: Record<string, unknown>): void {
       "threadRolloutRefs",
       "diskRolloutFiles",
       "missingReferencedFiles",
+      "missingActiveReferencedFiles",
+      "missingArchivedReferencedFiles",
+      "sessionRolloutFiles",
+      "archivedRolloutFiles",
       "orphanFiles",
       "orphanIndexedFiles",
       "orphanUnindexedFiles",
       "orphanSizeMib",
       "orphanIndexedSizeMib",
       "orphanUnindexedSizeMib",
+      "sessionOrphanFiles",
+      "sessionOrphanIndexedFiles",
+      "sessionOrphanUnindexedFiles",
+      "sessionOrphanSizeMib",
+      "archivedOrphanFiles",
+      "archivedOrphanSizeMib",
     ]) {
       console.log(`  ${key}: ${String(rollouts[key])}`);
     }
@@ -1562,16 +2347,21 @@ function printHumanReport(report: Record<string, unknown>): void {
 
 function printCleanApplySummary(report: Record<string, unknown>): void {
   const archive = asRecord(report.archive);
+  const orphanRollouts = asRecord(report.orphanRollouts);
   const compact = asRecord(report.compact);
   const vacuum = asRecord(report.vacuum);
   const logs = asRecord(report.logs);
+  const tuiLog = asRecord(report.tuiLog);
   const checkpoint = asRecord(report.checkpoint);
 
   printArchiveApplySummary(archive);
+  printOrphanRolloutApplySummary(orphanRollouts);
   printCompactApplySummary(compact);
   printVacuumSummary("State vacuum", vacuum);
   printLogsApplySummary(logs);
+  printTuiLogApplySummary(tuiLog);
   if (Object.keys(checkpoint).length) printWalCheckpoint(checkpoint);
+  printBackupReminder([archive, compact, vacuum, logs, tuiLog]);
 }
 
 function printArchiveApplySummary(report: Record<string, unknown>): void {
@@ -1594,6 +2384,31 @@ function printArchiveApplySummary(report: Record<string, unknown>): void {
     }
   }
   if (report.backupPath) console.log(`  backup: ${String(report.backupPath)}`);
+}
+
+function printOrphanRolloutSummary(report: Record<string, unknown>): void {
+  if (!Object.keys(report).length) return;
+  const before = asRecord(report.before);
+  const after = asRecord(report.after);
+  console.log("\nOrphan rollout archive:");
+  console.log(`  candidates: ${String(before.files ?? 0)} files (${String(before.size_mib ?? 0)} MiB)`);
+  console.log(`  indexed/unindexed: ${String(before.indexed_files ?? 0)}/${String(before.unindexed_files ?? 0)}`);
+  console.log(`  skipped recent: ${String(before.skipped_recent_files ?? 0)}`);
+  console.log(`  skipped destination exists: ${String(before.skipped_destination_exists_files ?? 0)}`);
+  console.log(`  empty dir candidates: ${String(before.empty_dir_candidates ?? 0)}`);
+  if (report.mode === "apply") {
+    console.log(`  moved files: ${String(report.movedFiles ?? 0)} (${String(report.movedMib ?? 0)} MiB)`);
+    console.log(`  empty dirs removed: ${String(report.prunedEmptyDirs ?? 0)}`);
+    console.log(`  remaining candidates: ${String(after.files ?? 0)}`);
+  }
+  if (Number((report.errors as unknown[] | undefined)?.length ?? 0) > 0) {
+    console.log(`  errors: ${String((report.errors as unknown[]).length)}`);
+  }
+  if (report.manifestPath) console.log(`  manifest: ${String(report.manifestPath)}`);
+}
+
+function printOrphanRolloutApplySummary(report: Record<string, unknown>): void {
+  printOrphanRolloutSummary(report);
 }
 
 function printCompactApplySummary(report: Record<string, unknown>): void {
@@ -1645,6 +2460,16 @@ function printLogsApplySummary(report: Record<string, unknown>): void {
   if (report.backupPath) console.log(`  backup: ${String(report.backupPath)}`);
 }
 
+function printTuiLogApplySummary(report: Record<string, unknown>): void {
+  if (!Object.keys(report).length) return;
+  const before = asRecord(report.before);
+  const after = asRecord(report.after);
+  console.log("\nTUI log cleanup:");
+  console.log(`  file: ${String(before.current_mib ?? 0)} MiB -> ${String(after.current_mib ?? 0)} MiB`);
+  console.log(`  truncated: ${String(report.truncatedMib ?? 0)} MiB`);
+  if (report.backupPath) console.log(`  backup: ${String(report.backupPath)}`);
+}
+
 function printWalCheckpoint(report: Record<string, unknown>): void {
   const before = asRecord(report.before);
   const after = asRecord(report.after);
@@ -1653,6 +2478,43 @@ function printWalCheckpoint(report: Record<string, unknown>): void {
   console.log("\nWAL checkpoint:");
   console.log(`  wal: ${String(beforeWal.mib ?? 0)} MiB -> ${String(afterWal.mib ?? 0)} MiB`);
   console.log(`  checkpointResult: ${JSON.stringify(report.checkpointResult)}`);
+}
+
+function printBackupReminder(reports: Record<string, unknown>[]): void {
+  const backupPaths = reports.map((report) => report.backupPath).filter((value) => typeof value === "string");
+  if (!backupPaths.length) return;
+  console.log(`\nBackups: ${path.dirname(String(backupPaths[0]))}`);
+  console.log("  Keep them until Codex looks right, then delete them to reclaim disk.");
+}
+
+function printBackupsReport(report: Record<string, unknown>): void {
+  console.log(`Backup dir: ${String(report.backupDir)}`);
+  if (report.action === "backups-schedule-prune") {
+    console.log(`Scheduler: ${String(report.scheduler)}`);
+    console.log(`Scheduled: ${String(report.scheduled)}`);
+    console.log(`Command: ${String(report.command)}`);
+    if (report.taskName) console.log(`Task: ${String(report.taskName)}`);
+    if (report.jobId) console.log(`Job: ${String(report.jobId)}`);
+    if (report.cancelCommand) console.log(`Cancel: ${String(report.cancelCommand)}`);
+    return;
+  }
+
+  const files = asRecord(report.files ?? report.before);
+  const candidates = asRecord(report.pruneCandidates ?? report.candidates);
+  console.log("\nBackups:");
+  console.log(`  files: ${String(files.count ?? 0)}`);
+  console.log(`  size: ${String(files.totalMib ?? 0)} MiB`);
+  console.log(`  oldest: ${String(files.oldestUtc ?? null)}`);
+  console.log(`  newest: ${String(files.newestUtc ?? null)}`);
+  console.log("\nPrune candidates:");
+  console.log(`  files: ${String(candidates.count ?? 0)}`);
+  console.log(`  size: ${String(candidates.totalMib ?? 0)} MiB`);
+  if (report.action === "backups-prune") {
+    const deleted = asRecord(report.deleted);
+    console.log("\nDeleted:");
+    console.log(`  files: ${String(deleted.count ?? 0)}`);
+    console.log(`  size: ${String(deleted.totalMib ?? 0)} MiB`);
+  }
 }
 
 function printDatabaseSpace(value: unknown): void {
@@ -1720,6 +2582,25 @@ function printArchiveCandidate(title: string, value: unknown): void {
   }
 }
 
+function printOrphanRolloutArchiveCandidate(title: string, value: unknown): void {
+  const object = asRecord(value);
+  if (!Object.keys(object).length) return;
+  console.log(`\n${title}:`);
+  for (const key of [
+    "files",
+    "size_mib",
+    "indexed_files",
+    "unindexed_files",
+    "empty_dir_candidates",
+    "skipped_recent_files",
+    "skipped_destination_exists_files",
+    "oldest_candidate_modified_utc",
+    "newest_candidate_modified_utc",
+  ]) {
+    if (object[key] !== undefined) console.log(`  ${key}: ${JSON.stringify(object[key])}`);
+  }
+}
+
 function printLogCleanupCandidate(title: string, value: unknown): void {
   const object = asRecord(value);
   if (!Object.keys(object).length) return;
@@ -1732,6 +2613,15 @@ function printLogCleanupCandidate(title: string, value: unknown): void {
     "cap_estimated_savings_mib",
     "cutoffUtc",
   ]) {
+    if (object[key] !== undefined) console.log(`  ${key}: ${JSON.stringify(object[key])}`);
+  }
+}
+
+function printTuiLogCleanupCandidate(title: string, value: unknown): void {
+  const object = asRecord(value);
+  if (!Object.keys(object).length) return;
+  console.log(`\n${title}:`);
+  for (const key of ["exists", "current_mib", "keep_mib", "reclaimable_mib", "path"]) {
     if (object[key] !== undefined) console.log(`  ${key}: ${JSON.stringify(object[key])}`);
   }
 }

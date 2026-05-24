@@ -7,11 +7,19 @@ import { describe, expect, test } from "vitest";
 import {
   collectCompactCandidateStats,
   collectLogCleanupStats,
+  collectOrphanRolloutArchiveStats,
+  collectTuiLogCleanupStats,
   collectStaleArchiveCandidateStats,
+  archiveOrphanRollouts,
+  cleanTuiLog,
   compactWhere,
+  nextFileBackupPath,
   nextBackupPath,
+  pruneBackups,
   resolveCodexSpawnCommand,
   rolloutThreadId,
+  scanBackups,
+  truncateFileToTail,
 } from "../src/cleaner.js";
 
 describe("rolloutThreadId", () => {
@@ -169,6 +177,24 @@ describe("nextBackupPath", () => {
   });
 });
 
+describe("nextFileBackupPath", () => {
+  test("uses a regular file backup suffix", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    try {
+      const now = new Date("2026-05-22T21:41:25.123Z");
+      const first = nextFileBackupPath(path.join(dir, "codex-tui.log"), dir, now);
+      fs.writeFileSync(first, "");
+
+      const second = nextFileBackupPath(path.join(dir, "codex-tui.log"), dir, now);
+
+      expect(path.basename(first)).toBe("codex-tui.log.20260522T214125_123Z.bak");
+      expect(path.basename(second)).toBe("codex-tui.log.20260522T214125_123Z.2.bak");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("collectLogCleanupStats", () => {
   test("counts old rows separately from oversized retained log bodies", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
@@ -199,21 +225,31 @@ describe("collectLogCleanupStats", () => {
 
       const stats = collectLogCleanupStats(db, {
         allowRunningReadonly: false,
+        allowRunningOrphanRolloutArchive: false,
+        afterHours: 48,
         apply: false,
+        archiveOrphanRollouts: false,
         archiveStale: true,
         archivedOnly: false,
+        confirmDeleteBackups: false,
         confirmArchiveStale: false,
+        confirmArchiveOrphanRollouts: false,
         compactRecentMetadata: false,
         confirmLossyMetadata: false,
         confirmPruneLogs: false,
+        confirmPruneTuiLog: false,
+        confirmScheduleBackupPrune: false,
         includeLogs: true,
         includeRollouts: false,
         json: false,
         keepLogDays: 7,
         keepRecentDays: 14,
+        keepTuiLogMib: 16,
         maxChars: 1024,
         maxLogBodyChars: 100,
+        olderThanHours: 48,
         pruneLogs: true,
+        pruneTuiLog: false,
       });
 
       expect(stats.delete_rows).toBe(1);
@@ -221,6 +257,152 @@ describe("collectLogCleanupStats", () => {
       expect(stats.cap_estimated_savings_mib).toBeGreaterThan(0);
     } finally {
       db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("TUI log cleanup", () => {
+  test("estimates and keeps only the newest log tail", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    const logDir = path.join(dir, "log");
+    const logPath = path.join(logDir, "codex-tui.log");
+    try {
+      fs.mkdirSync(logDir, { recursive: true });
+      fs.writeFileSync(logPath, "0123456789");
+
+      const stats = collectTuiLogCleanupStats(logPath, 1);
+      expect(stats.current_bytes).toBe(10);
+      expect(stats.reclaimable_bytes).toBe(0);
+
+      truncateFileToTail(logPath, 4);
+      expect(fs.readFileSync(logPath, "utf8")).toBe("6789");
+
+      fs.writeFileSync(logPath, Buffer.concat([Buffer.alloc(1024 * 1024, "a"), Buffer.from("tail")]));
+      const report = await cleanTuiLog({
+        allowRunningReadonly: false,
+        allowRunningOrphanRolloutArchive: false,
+        afterHours: 48,
+        apply: true,
+        archiveOrphanRollouts: false,
+        archiveStale: true,
+        archivedOnly: false,
+        codexHome: dir,
+        compactRecentMetadata: false,
+        confirmArchiveStale: false,
+        confirmArchiveOrphanRollouts: false,
+        confirmDeleteBackups: false,
+        confirmLossyMetadata: false,
+        confirmPruneLogs: false,
+        confirmPruneTuiLog: true,
+        confirmScheduleBackupPrune: false,
+        includeLogs: false,
+        includeRollouts: false,
+        json: false,
+        keepLogDays: 7,
+        keepRecentDays: 14,
+        keepTuiLogMib: 1,
+        maxChars: 1024,
+        maxLogBodyChars: 4096,
+        olderThanHours: 48,
+        pruneLogs: false,
+        pruneTuiLog: true,
+      });
+
+      expect(fs.statSync(logPath).size).toBe(1024 * 1024);
+      expect(fs.readFileSync(logPath).subarray(-4).toString()).toBe("tail");
+      expect(fs.existsSync(String(report.backupPath))).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("backup pruning", () => {
+  test("dry-runs and deletes only old codex-cleaner backup files", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    const backupDir = path.join(dir, ".codex-cleanup-backups");
+    try {
+      fs.mkdirSync(backupDir, { recursive: true });
+      const oldBackup = path.join(backupDir, "state_5.sqlite.20260522T214125_123Z.bak.sqlite");
+      const newBackup = path.join(backupDir, "codex-tui.log.20260522T214125_123Z.bak");
+      const ignored = path.join(backupDir, "notes.txt");
+      fs.writeFileSync(oldBackup, "old backup");
+      fs.writeFileSync(newBackup, "new backup");
+      fs.writeFileSync(ignored, "not ours");
+      const oldDate = new Date(Date.now() - 50 * 60 * 60 * 1000);
+      fs.utimesSync(oldBackup, oldDate, oldDate);
+
+      const scan = scanBackups({
+        allowRunningReadonly: false,
+        allowRunningOrphanRolloutArchive: false,
+        afterHours: 48,
+        apply: false,
+        archiveOrphanRollouts: false,
+        archiveStale: true,
+        archivedOnly: false,
+        backupDir,
+        codexHome: dir,
+        compactRecentMetadata: false,
+        confirmArchiveStale: false,
+        confirmArchiveOrphanRollouts: false,
+        confirmDeleteBackups: false,
+        confirmLossyMetadata: false,
+        confirmPruneLogs: false,
+        confirmPruneTuiLog: false,
+        confirmScheduleBackupPrune: false,
+        includeLogs: false,
+        includeRollouts: false,
+        json: false,
+        keepLogDays: 7,
+        keepRecentDays: 14,
+        keepTuiLogMib: 16,
+        maxChars: 1024,
+        maxLogBodyChars: 4096,
+        olderThanHours: 48,
+        pruneLogs: false,
+        pruneTuiLog: false,
+      });
+
+      expect((scan.files as Record<string, unknown>).count).toBe(2);
+      expect((scan.pruneCandidates as Record<string, unknown>).count).toBe(1);
+
+      const report = pruneBackups({
+        allowRunningReadonly: false,
+        allowRunningOrphanRolloutArchive: false,
+        afterHours: 48,
+        apply: true,
+        archiveOrphanRollouts: false,
+        archiveStale: true,
+        archivedOnly: false,
+        backupDir,
+        codexHome: dir,
+        compactRecentMetadata: false,
+        confirmArchiveStale: false,
+        confirmArchiveOrphanRollouts: false,
+        confirmDeleteBackups: true,
+        confirmLossyMetadata: false,
+        confirmPruneLogs: false,
+        confirmPruneTuiLog: false,
+        confirmScheduleBackupPrune: false,
+        includeLogs: false,
+        includeRollouts: false,
+        json: false,
+        keepLogDays: 7,
+        keepRecentDays: 14,
+        keepTuiLogMib: 16,
+        maxChars: 1024,
+        maxLogBodyChars: 4096,
+        olderThanHours: 48,
+        pruneLogs: false,
+        pruneTuiLog: false,
+      });
+
+      expect((report.deleted as Record<string, unknown>).count).toBe(1);
+      expect(fs.existsSync(oldBackup)).toBe(false);
+      expect(fs.existsSync(newBackup)).toBe(true);
+      expect(fs.existsSync(ignored)).toBe(true);
+    } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -332,6 +514,100 @@ describe("collectStaleArchiveCandidateStats", () => {
       expect(stats.missing_rollout_files).toBe(0);
     } finally {
       db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("orphan rollout archiving", () => {
+  test("moves only old DB-unreferenced session rollouts into archived_sessions", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    const sessions = path.join(dir, "sessions", "2026", "03", "26");
+    const archived = path.join(dir, "archived_sessions");
+    const dbPath = path.join(dir, "state_5.sqlite");
+    const db = new Database(dbPath);
+    try {
+      fs.mkdirSync(sessions, { recursive: true });
+      fs.mkdirSync(archived, { recursive: true });
+      const emptySessionDir = path.join(dir, "sessions", "2026", "02", "01");
+      const emptyArchivedDir = path.join(archived, "empty-child");
+      fs.mkdirSync(emptySessionDir, { recursive: true });
+      fs.mkdirSync(emptyArchivedDir, { recursive: true });
+      db.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)");
+
+      const referencedId = "00000000-0000-4000-8000-000000000001";
+      const oldOrphanId = "00000000-0000-4000-8000-000000000002";
+      const recentOrphanId = "00000000-0000-4000-8000-000000000003";
+      const collisionOrphanId = "00000000-0000-4000-8000-000000000004";
+      const rollout = (id: string): string => path.join(sessions, `rollout-2026-03-26T00-00-00-${id}.jsonl`);
+      const referenced = rollout(referencedId);
+      const oldOrphan = rollout(oldOrphanId);
+      const recentOrphan = rollout(recentOrphanId);
+      const collisionOrphan = rollout(collisionOrphanId);
+      for (const file of [referenced, oldOrphan, recentOrphan, collisionOrphan]) {
+        fs.writeFileSync(file, `{"type":"session_meta","payload":{"id":"${rolloutThreadId(file)}"}}\n`);
+      }
+      const oldDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+      for (const file of [referenced, oldOrphan, collisionOrphan]) {
+        fs.utimesSync(file, oldDate, oldDate);
+      }
+      fs.writeFileSync(path.join(archived, path.basename(collisionOrphan)), "already archived");
+      fs.writeFileSync(
+        path.join(dir, "session_index.jsonl"),
+        `${JSON.stringify({ id: oldOrphanId, thread_name: "old orphan", updated_at: oldDate.toISOString() })}\n`,
+      );
+      db.prepare("INSERT INTO threads VALUES (?, ?)").run(referencedId, referenced);
+
+      const cutoffMs = Date.now() - 14 * 24 * 60 * 60 * 1000;
+      const stats = collectOrphanRolloutArchiveStats(db, dir, { cutoffMs });
+      expect(stats.files).toBe(1);
+      expect(stats.indexed_files).toBe(1);
+      expect(stats.skipped_recent_files).toBe(1);
+      expect(stats.skipped_destination_exists_files).toBe(1);
+      expect(Number(stats.empty_dir_candidates)).toBeGreaterThanOrEqual(2);
+      db.close();
+
+      const report = archiveOrphanRollouts({
+        allowRunningReadonly: false,
+        allowRunningOrphanRolloutArchive: false,
+        afterHours: 48,
+        apply: true,
+        archiveOrphanRollouts: true,
+        archiveStale: true,
+        archivedOnly: false,
+        codexHome: dir,
+        compactRecentMetadata: false,
+        confirmArchiveStale: false,
+        confirmArchiveOrphanRollouts: true,
+        confirmDeleteBackups: false,
+        confirmLossyMetadata: false,
+        confirmPruneLogs: false,
+        confirmPruneTuiLog: false,
+        confirmScheduleBackupPrune: false,
+        includeLogs: false,
+        includeRollouts: false,
+        json: false,
+        keepLogDays: 7,
+        keepRecentDays: 14,
+        keepTuiLogMib: 16,
+        maxChars: 1024,
+        maxLogBodyChars: 4096,
+        olderThanHours: 48,
+        pruneLogs: false,
+        pruneTuiLog: false,
+      });
+
+      expect(report.movedFiles).toBe(1);
+      expect(fs.existsSync(oldOrphan)).toBe(false);
+      expect(fs.existsSync(path.join(archived, path.basename(oldOrphan)))).toBe(true);
+      expect(fs.existsSync(recentOrphan)).toBe(true);
+      expect(fs.existsSync(collisionOrphan)).toBe(true);
+      expect(fs.existsSync(emptySessionDir)).toBe(false);
+      expect(fs.existsSync(emptyArchivedDir)).toBe(false);
+      expect(Number(report.prunedEmptyDirs)).toBeGreaterThanOrEqual(2);
+      expect(fs.existsSync(String(report.manifestPath))).toBe(true);
+    } finally {
+      if (db.open) db.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
