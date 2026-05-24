@@ -460,7 +460,10 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
       });
     }
     if (options.archiveOrphanRollouts) {
-      report.orphanRolloutArchiveCandidates = collectOrphanRolloutArchiveStats(db, codexHome, { cutoffMs });
+      report.orphanRolloutArchiveCandidates = collectOrphanRolloutArchiveStats(db, codexHome, {
+        cutoffMs,
+        protectedIds,
+      });
     }
     report.recentSample = queryAll(
       db,
@@ -709,10 +712,11 @@ export function archiveOrphanRollouts(options: CleanerOptions): Record<string, u
   const codexHome = resolveCodexHome(options);
   const stateDb = path.join(codexHome, "state_5.sqlite");
   const cutoffMs = recentCutoffMs(options.keepRecentDays);
+  const protectedIds = allProtectedIds(loadThreadProtection(codexHome, loadGlobalState(codexHome)));
   const beforeDb = openReadonlyDb(stateDb);
   let beforePlan: OrphanRolloutPlan;
   try {
-    beforePlan = buildOrphanRolloutPlan(beforeDb, codexHome, { cutoffMs });
+    beforePlan = buildOrphanRolloutPlan(beforeDb, codexHome, { cutoffMs, protectedIds });
   } finally {
     beforeDb.close();
   }
@@ -732,6 +736,7 @@ export function archiveOrphanRollouts(options: CleanerOptions): Record<string, u
       codexHome,
       policy: {
         keepRecentDays: options.keepRecentDays,
+        protectedThreads: protectedIds.size,
         recentCutoffMs: cutoffMs,
         recentCutoffUtc: millisToIso(cutoffMs),
       },
@@ -763,6 +768,7 @@ export function archiveOrphanRollouts(options: CleanerOptions): Record<string, u
       codexHome,
       policy: {
         keepRecentDays: options.keepRecentDays,
+        protectedThreads: protectedIds.size,
         recentCutoffMs: cutoffMs,
         recentCutoffUtc: millisToIso(cutoffMs),
       },
@@ -776,7 +782,7 @@ export function archiveOrphanRollouts(options: CleanerOptions): Record<string, u
   const afterDb = openReadonlyDb(stateDb);
   let afterPlan: OrphanRolloutPlan;
   try {
-    afterPlan = buildOrphanRolloutPlan(afterDb, codexHome, { cutoffMs });
+    afterPlan = buildOrphanRolloutPlan(afterDb, codexHome, { cutoffMs, protectedIds });
   } finally {
     afterDb.close();
   }
@@ -788,6 +794,7 @@ export function archiveOrphanRollouts(options: CleanerOptions): Record<string, u
     generatedAt: new Date().toISOString(),
     policy: {
       keepRecentDays: options.keepRecentDays,
+      protectedThreads: protectedIds.size,
       recentCutoffMs: cutoffMs,
       recentCutoffUtc: millisToIso(cutoffMs),
     },
@@ -1392,12 +1399,16 @@ export function collectTuiLogCleanupStats(logPath: string, keepMib: number): Rec
 export function collectOrphanRolloutArchiveStats(
   db: DatabaseSync,
   codexHome: string,
-  args: { cutoffMs: number },
+  args: { cutoffMs: number; protectedIds: Set<string> },
 ): Record<string, unknown> {
   return buildOrphanRolloutPlan(db, codexHome, args).stats;
 }
 
-function buildOrphanRolloutPlan(db: DatabaseSync, codexHome: string, args: { cutoffMs: number }): OrphanRolloutPlan {
+function buildOrphanRolloutPlan(
+  db: DatabaseSync,
+  codexHome: string,
+  args: { cutoffMs: number; protectedIds: Set<string> },
+): OrphanRolloutPlan {
   const refs = queryAll(db, "SELECT rollout_path FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != ''");
   const referencedPaths = new Set(refs.map((row) => normalizePath(String(row.rollout_path))));
   const sessionFiles = listRolloutFiles(path.join(codexHome, "sessions"));
@@ -1421,6 +1432,10 @@ function buildOrphanRolloutPlan(db: DatabaseSync, codexHome: string, args: { cut
     };
     if (stat.mtimeMs >= args.cutoffMs) {
       skipped.push({ ...move, reason: "recent" });
+      continue;
+    }
+    if (threadId && args.protectedIds.has(threadId)) {
+      skipped.push({ ...move, reason: "protected" });
       continue;
     }
     if (move.indexed) {
@@ -1455,6 +1470,7 @@ function buildOrphanRolloutPlan(db: DatabaseSync, codexHome: string, args: { cut
       unindexed_size_mib: fileMoveListSizeMib(unindexed),
       skipped_files: skipped.length,
       skipped_recent_files: skipped.filter((move) => move.reason === "recent").length,
+      skipped_protected_files: skipped.filter((move) => move.reason === "protected").length,
       skipped_session_indexed_files: skipped.filter((move) => move.reason === "session-indexed").length,
       skipped_destination_exists_files: skipped.filter((move) => move.reason === "destination-exists").length,
       oldest_candidate_modified_utc: millisToIso(minNumberOrNull(modifiedValues)),
@@ -2582,6 +2598,7 @@ function printOrphanRolloutArchiveCandidate(title: string, value: unknown): void
     "unindexed_files",
     "empty_dir_candidates",
     "skipped_recent_files",
+    "skipped_protected_files",
     "skipped_session_indexed_files",
     "skipped_destination_exists_files",
     "oldest_candidate_modified_utc",

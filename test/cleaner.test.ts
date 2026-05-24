@@ -519,19 +519,25 @@ describe("orphan rollout archiving", () => {
       const recentOrphanId = "00000000-0000-4000-8000-000000000003";
       const collisionOrphanId = "00000000-0000-4000-8000-000000000004";
       const indexedOrphanId = "00000000-0000-4000-8000-000000000005";
+      const protectedOrphanId = "00000000-0000-4000-8000-000000000006";
       const rollout = (id: string): string => path.join(sessions, `rollout-2026-03-26T00-00-00-${id}.jsonl`);
       const referenced = rollout(referencedId);
       const oldOrphan = rollout(oldOrphanId);
       const recentOrphan = rollout(recentOrphanId);
       const collisionOrphan = rollout(collisionOrphanId);
       const indexedOrphan = rollout(indexedOrphanId);
-      for (const file of [referenced, oldOrphan, recentOrphan, collisionOrphan, indexedOrphan]) {
+      const protectedOrphan = rollout(protectedOrphanId);
+      for (const file of [referenced, oldOrphan, recentOrphan, collisionOrphan, indexedOrphan, protectedOrphan]) {
         fs.writeFileSync(file, `{"type":"session_meta","payload":{"id":"${rolloutThreadId(file)}"}}\n`);
       }
       const oldDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-      for (const file of [referenced, oldOrphan, collisionOrphan, indexedOrphan]) {
+      for (const file of [referenced, oldOrphan, collisionOrphan, indexedOrphan, protectedOrphan]) {
         fs.utimesSync(file, oldDate, oldDate);
       }
+      fs.writeFileSync(
+        path.join(dir, ".codex-global-state.json"),
+        JSON.stringify({ "pinned-thread-ids": [protectedOrphanId] }),
+      );
       fs.writeFileSync(path.join(archived, path.basename(collisionOrphan)), "already archived");
       fs.writeFileSync(
         path.join(dir, "session_index.jsonl"),
@@ -540,10 +546,11 @@ describe("orphan rollout archiving", () => {
       db.prepare("INSERT INTO threads VALUES (?, ?)").run(referencedId, referenced);
 
       const cutoffMs = Date.now() - 14 * 24 * 60 * 60 * 1000;
-      const stats = collectOrphanRolloutArchiveStats(db, dir, { cutoffMs });
+      const stats = collectOrphanRolloutArchiveStats(db, dir, { cutoffMs, protectedIds: new Set([protectedOrphanId]) });
       expect(stats.files).toBe(1);
       expect(stats.indexed_files).toBe(0);
       expect(stats.skipped_recent_files).toBe(1);
+      expect(stats.skipped_protected_files).toBe(1);
       expect(stats.skipped_session_indexed_files).toBe(1);
       expect(stats.skipped_destination_exists_files).toBe(1);
       expect(Number(stats.empty_dir_candidates)).toBeGreaterThanOrEqual(1);
@@ -564,6 +571,7 @@ describe("orphan rollout archiving", () => {
       expect(fs.existsSync(recentOrphan)).toBe(true);
       expect(fs.existsSync(collisionOrphan)).toBe(true);
       expect(fs.existsSync(indexedOrphan)).toBe(true);
+      expect(fs.existsSync(protectedOrphan)).toBe(true);
       expect(fs.existsSync(emptySessionDir)).toBe(false);
       expect(fs.existsSync(emptyArchivedDir)).toBe(true);
       expect(Number(report.prunedEmptyDirs)).toBeGreaterThanOrEqual(1);

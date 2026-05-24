@@ -361,6 +361,9 @@ function printDryRunSummary(report: Record<string, unknown>): void {
         pc.yellow(`  Skipped ${String(orphanRollouts.skipped_recent_files)} orphan rollouts inside the recent window.`),
       );
     }
+    if (Number(orphanRollouts.skipped_protected_files) > 0) {
+      console.log(pc.yellow(`  Skipped ${String(orphanRollouts.skipped_protected_files)} protected orphan rollouts.`));
+    }
     if (Number(orphanRollouts.skipped_session_indexed_files) > 0) {
       console.log(
         pc.yellow(
