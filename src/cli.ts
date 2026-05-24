@@ -1,20 +1,8 @@
 #!/usr/bin/env node
+import { spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 
-import {
-  buildScanReport,
-  archiveOrphanRollouts,
-  checkpointWal,
-  cleanCodex,
-  compactMetadata,
-  emitReport,
-  pruneBackups,
-  requireStoppedOrReadonlyAllowed,
-  scanBackups,
-  scheduleBackupPrune,
-} from "./cleaner.js";
 import type { BackupCommand, CleanerCommand, CleanerOptions } from "./types.js";
-import { runWizard } from "./wizard.js";
 
 const USAGE = `
 codex-cleaner [command] [options]
@@ -151,7 +139,24 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
     pruneTuiLog: Boolean(parsed.values["prune-tui-log"]),
   };
 
+  const reexecCode = reexecWithSqliteWarningDisabled(argv);
+  if (reexecCode != null) return reexecCode;
+
+  const {
+    archiveOrphanRollouts,
+    buildScanReport,
+    checkpointWal,
+    cleanCodex,
+    compactMetadata,
+    emitReport,
+    pruneBackups,
+    requireStoppedOrReadonlyAllowed,
+    scanBackups,
+    scheduleBackupPrune,
+  } = await import("./cleaner.js");
+
   if (!command) {
+    const { runWizard } = await import("./wizard.js");
     return runWizard(options);
   }
 
@@ -206,6 +211,27 @@ function isMutating(command: CleanerCommand, options: CleanerOptions): boolean {
 
 function allowsRunningFileOnlyMutation(command: CleanerCommand, options: CleanerOptions): boolean {
   return command === "archive-orphan-rollouts" && options.apply && options.allowRunningOrphanRolloutArchive;
+}
+
+function reexecWithSqliteWarningDisabled(argv: string[]): number | null {
+  const alreadyDisabled =
+    process.env.NODE_NO_WARNINGS === "1" ||
+    process.execArgv.includes("--no-warnings") ||
+    process.execArgv.includes("--disable-warning=ExperimentalWarning");
+  if (alreadyDisabled) return null;
+  if (!process.allowedNodeEnvironmentFlags.has("--disable-warning=ExperimentalWarning")) return null;
+  if (!process.argv[1]) return null;
+
+  const result = spawnSync(
+    process.execPath,
+    [...process.execArgv, "--disable-warning=ExperimentalWarning", process.argv[1], ...argv],
+    {
+      stdio: "inherit",
+      windowsHide: true,
+    },
+  );
+  if (result.error) throw result.error;
+  return result.status ?? 1;
 }
 
 function parsePositiveInt(raw: string, name: string): number {

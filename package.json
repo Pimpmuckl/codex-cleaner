@@ -4,7 +4,7 @@
   "description": "Guarded cleanup and compaction utility for local Codex state.",
   "license": "MIT",
   "type": "module",
-  "packageManager": "npm@11.11.0",
+  "packageManager": "npm@11.15.0",
   "bin": {
     "codex-cleaner": "dist/cli.js"
   },
@@ -13,7 +13,7 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=22.12"
+    "node": ">=22.16"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -21,16 +21,14 @@
     "format": "prettier --check .",
     "lint": "eslint .",
     "prepack": "npm run build",
-    "test": "vitest run"
+    "test": "node scripts/run-vitest.js"
   },
   "dependencies": {
     "@inquirer/prompts": "^8.4.3",
-    "better-sqlite3": "^12.10.0",
     "picocolors": "^1.1.1"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.9.1",
     "eslint": "^10.4.0",
     "globals": "^17.6.0",

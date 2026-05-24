@@ -34,7 +34,8 @@ export async function runWizard(options: CleanerOptions): Promise<number> {
   }
 
   const wizardMode = await askWizardMode();
-  const keepRecentDays = wizardMode === "recommended" ? options.keepRecentDays : await askKeepRecentDays(options.keepRecentDays);
+  const keepRecentDays =
+    wizardMode === "recommended" ? options.keepRecentDays : await askKeepRecentDays(options.keepRecentDays);
   const maxChars = wizardMode === "recommended" ? options.maxChars : await askMaxChars(options.maxChars);
   const compactRecentMetadata = wizardMode === "recommended" ? false : await askCompactRecentMetadata();
   const archiveStale = wizardMode === "recommended" ? true : await askArchiveStale();
@@ -138,7 +139,9 @@ async function waitForApplyConfirmation(): Promise<boolean> {
     const blockers = await findBlockingProcesses();
     if (!blockers.length) return true;
 
-    console.log(pc.yellow(`\nCodex is still running (${blockers.length} matching processes). No changes were applied.`));
+    console.log(
+      pc.yellow(`\nCodex is still running (${blockers.length} matching processes). No changes were applied.`),
+    );
     console.log(pc.dim("Close Codex completely before applying DB or WAL cleanup."));
     const retry = await confirm({
       default: true,
@@ -479,7 +482,10 @@ function printApplySummary(
   }
 }
 
-async function offerScheduledBackupCleanup(options: CleanerOptions, applyReport: Record<string, unknown>): Promise<void> {
+async function offerScheduledBackupCleanup(
+  options: CleanerOptions,
+  applyReport: Record<string, unknown>,
+): Promise<void> {
   const backupPaths = [
     nullableRecordAt(applyReport, "archive"),
     recordAt(applyReport, "compact"),
@@ -505,7 +511,9 @@ async function offerScheduledBackupCleanup(options: CleanerOptions, applyReport:
       confirmScheduleBackupPrune: true,
     });
   } catch (error) {
-    console.log(pc.yellow(`Could not schedule backup cleanup: ${error instanceof Error ? error.message : String(error)}`));
+    console.log(
+      pc.yellow(`Could not schedule backup cleanup: ${error instanceof Error ? error.message : String(error)}`),
+    );
     return;
   }
   console.log(pc.bold("\nBackup cleanup scheduled"));

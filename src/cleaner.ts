@@ -2,9 +2,8 @@ import { execFile, spawn, spawnSync, type ChildProcessWithoutNullStreams } from 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { backup as sqliteBackup, DatabaseSync } from "node:sqlite";
 import { promisify } from "node:util";
-
-import Database from "better-sqlite3";
 
 import type { BlockingProcess, CleanerOptions, CompactWhere, ThreadProtection } from "./types.js";
 
@@ -378,14 +377,16 @@ async function stopAppServer(child: ChildProcessWithoutNullStreams): Promise<voi
     } else {
       terminate();
     }
-    timers.push(setTimeout(() => {
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // Process already exited.
-      }
-      done();
-    }, APP_SERVER_SHUTDOWN_TIMEOUT_MS));
+    timers.push(
+      setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Process already exited.
+        }
+        done();
+      }, APP_SERVER_SHUTDOWN_TIMEOUT_MS),
+    );
     child.once("exit", done);
   });
 }
@@ -547,9 +548,8 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
         (column) =>
           `${column} = CASE WHEN length(${column}) > @maxChars THEN substr(${column}, 1, @maxChars) ELSE ${column} END`,
       ).join(", ");
-      const update = db.prepare(`UPDATE threads SET ${assignments} WHERE ${where.sql}`);
-      const tx = db.transaction(() => update.run(where.params));
-      changedRows = Number(tx().changes);
+      const update = prepareStatement(db, `UPDATE threads SET ${assignments} WHERE ${where.sql}`);
+      changedRows = Number(runTransaction(db, () => update.run(where.params).changes));
     }
 
     const after = collectCompactCandidateStats(db, {
@@ -883,14 +883,14 @@ export async function cleanLogs(options: CleanerOptions): Promise<Record<string,
       backupPath = await backupSqliteDatabase(logsDb, resolveBackupDir(options, codexHome));
       const cutoffSeconds = logCutoffSeconds(options.keepLogDays);
       if (hasRowChanges) {
-        const tx = db.transaction(() => {
+        runTransaction(db, () => {
           deletedRows = Number(
-            db.prepare("DELETE FROM logs WHERE ts < @cutoffSeconds").run({ cutoffSeconds }).changes,
+            prepareStatement(db, "DELETE FROM logs WHERE ts < @cutoffSeconds").run({ cutoffSeconds }).changes,
           );
           cappedRows = Number(
-            db
-              .prepare(
-                `
+            prepareStatement(
+              db,
+              `
                 UPDATE logs
                 SET estimated_bytes = max(0, estimated_bytes - (length(feedback_log_body) - @maxLogBodyChars)),
                     feedback_log_body = substr(feedback_log_body, 1, @maxLogBodyChars)
@@ -898,11 +898,9 @@ export async function cleanLogs(options: CleanerOptions): Promise<Record<string,
                   AND feedback_log_body IS NOT NULL
                   AND length(feedback_log_body) > @maxLogBodyChars
               `,
-              )
-              .run({ cutoffSeconds, maxLogBodyChars: options.maxLogBodyChars }).changes,
+            ).run({ cutoffSeconds, maxLogBodyChars: options.maxLogBodyChars }).changes,
           );
         });
-        tx();
       }
       db.exec("VACUUM");
       queryAll(db, "PRAGMA wal_checkpoint(TRUNCATE)");
@@ -1067,9 +1065,7 @@ export function compactWhere(args: {
   protectRecent: boolean;
   protectedIds: Set<string>;
 }): CompactWhere {
-  const clauses = [
-    `(${THREAD_COLUMNS_TO_CAP.map((column) => `length(${column}) > @maxChars`).join(" OR ")})`,
-  ];
+  const clauses = [`(${THREAD_COLUMNS_TO_CAP.map((column) => `length(${column}) > @maxChars`).join(" OR ")})`];
   const params: Record<string, string | number> = {
     cutoffMs: args.cutoffMs,
     maxChars: args.maxChars,
@@ -1097,7 +1093,7 @@ export function compactWhere(args: {
 }
 
 export function collectCompactCandidateStats(
-  db: Database.Database,
+  db: DatabaseSync,
   args: {
     archivedOnly: boolean;
     cutoffMs: number;
@@ -1152,7 +1148,7 @@ type StaleArchivePlan = {
 };
 
 export function collectStaleArchiveCandidateStats(
-  db: Database.Database,
+  db: DatabaseSync,
   codexHome: string,
   args: { cutoffMs: number; protectedIds: Set<string>; statRollouts?: boolean },
 ): Record<string, unknown> {
@@ -1160,7 +1156,7 @@ export function collectStaleArchiveCandidateStats(
 }
 
 function buildStaleArchivePlan(
-  db: Database.Database,
+  db: DatabaseSync,
   codexHome: string,
   args: { cutoffMs: number; protectedIds: Set<string>; statRollouts?: boolean },
 ): StaleArchivePlan {
@@ -1276,7 +1272,7 @@ function buildStaleArchivePlan(
   };
 }
 
-function collectThreadStats(db: Database.Database): Record<string, unknown> {
+function collectThreadStats(db: DatabaseSync): Record<string, unknown> {
   const stats = queryOne(
     db,
     `
@@ -1297,7 +1293,7 @@ function collectThreadStats(db: Database.Database): Record<string, unknown> {
   };
 }
 
-function collectLogStats(db: Database.Database): Record<string, unknown> {
+function collectLogStats(db: DatabaseSync): Record<string, unknown> {
   const stats = queryOne(
     db,
     `
@@ -1328,7 +1324,7 @@ function collectLogStats(db: Database.Database): Record<string, unknown> {
   };
 }
 
-export function collectLogCleanupStats(db: Database.Database, options: CleanerOptions): Record<string, unknown> {
+export function collectLogCleanupStats(db: DatabaseSync, options: CleanerOptions): Record<string, unknown> {
   const params = {
     cutoffSeconds: logCutoffSeconds(options.keepLogDays),
     maxLogBodyChars: options.maxLogBodyChars,
@@ -1394,22 +1390,15 @@ export function collectTuiLogCleanupStats(logPath: string, keepMib: number): Rec
 }
 
 export function collectOrphanRolloutArchiveStats(
-  db: Database.Database,
+  db: DatabaseSync,
   codexHome: string,
   args: { cutoffMs: number },
 ): Record<string, unknown> {
   return buildOrphanRolloutPlan(db, codexHome, args).stats;
 }
 
-function buildOrphanRolloutPlan(
-  db: Database.Database,
-  codexHome: string,
-  args: { cutoffMs: number },
-): OrphanRolloutPlan {
-  const refs = queryAll(
-    db,
-    "SELECT rollout_path FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != ''",
-  );
+function buildOrphanRolloutPlan(db: DatabaseSync, codexHome: string, args: { cutoffMs: number }): OrphanRolloutPlan {
+  const refs = queryAll(db, "SELECT rollout_path FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != ''");
   const referencedPaths = new Set(refs.map((row) => normalizePath(String(row.rollout_path))));
   const sessionFiles = listRolloutFiles(path.join(codexHome, "sessions"));
   const sessionIndexIds = loadSessionIndexIds(codexHome);
@@ -1475,7 +1464,7 @@ function buildOrphanRolloutPlan(
   };
 }
 
-function collectRolloutLinkage(db: Database.Database, codexHome: string): Record<string, unknown> {
+function collectRolloutLinkage(db: DatabaseSync, codexHome: string): Record<string, unknown> {
   const refs = queryAll(
     db,
     "SELECT id, archived, rollout_path FROM threads WHERE rollout_path IS NOT NULL AND rollout_path != ''",
@@ -1628,7 +1617,7 @@ async function backupSqliteDatabase(dbPath: string, backupDir: string): Promise<
   const backupPath = nextBackupPath(dbPath, backupDir);
   const db = openWritableDb(dbPath);
   try {
-    await db.backup(backupPath);
+    await sqliteBackup(db, backupPath);
   } finally {
     db.close();
   }
@@ -1691,10 +1680,7 @@ function nextOrphanRolloutManifestPath(backupDir: string, now = new Date()): str
 }
 
 function nextTimestampedPath(backupDir: string, name: string, suffix: string, now: Date): string {
-  const stamp = now
-    .toISOString()
-    .replace(/[-:]/g, "")
-    .replace(".", "_");
+  const stamp = now.toISOString().replace(/[-:]/g, "").replace(".", "_");
   const base = `${name}.${stamp}`;
   let candidate = path.join(backupDir, `${base}${suffix}`);
   let collision = 2;
@@ -1895,36 +1881,46 @@ function timestampForName(date: Date): string {
     .replace(/\.\d{3}Z$/, "Z");
 }
 
-function openReadonlyDb(file: string): Database.Database {
+function openReadonlyDb(file: string): DatabaseSync {
   if (!fs.existsSync(file)) throw new Error(`SQLite database not found: ${file}`);
-  return new Database(file, { fileMustExist: true, readonly: true });
+  return new DatabaseSync(file, { readOnly: true });
 }
 
-function openWritableDb(file: string): Database.Database {
+function openWritableDb(file: string): DatabaseSync {
   if (!fs.existsSync(file)) throw new Error(`SQLite database not found: ${file}`);
-  const db = new Database(file, { fileMustExist: true });
-  db.pragma("busy_timeout = 5000");
-  db.pragma("foreign_keys = ON");
+  const db = new DatabaseSync(file);
+  db.exec("PRAGMA busy_timeout = 5000");
+  db.exec("PRAGMA foreign_keys = ON");
   return db;
 }
 
-function queryAll(
-  db: Database.Database,
-  sql: string,
-  params?: Record<string, string | number>,
-): Record<string, unknown>[] {
-  return db.prepare(sql).all(params ?? {}) as Record<string, unknown>[];
+function queryAll(db: DatabaseSync, sql: string, params?: Record<string, string | number>): Record<string, unknown>[] {
+  return prepareStatement(db, sql).all(params ?? {}) as Record<string, unknown>[];
 }
 
-function queryOne(
-  db: Database.Database,
-  sql: string,
-  params?: Record<string, string | number>,
-): Record<string, unknown> {
-  return (db.prepare(sql).get(params ?? {}) as Record<string, unknown> | undefined) ?? {};
+function queryOne(db: DatabaseSync, sql: string, params?: Record<string, string | number>): Record<string, unknown> {
+  return (prepareStatement(db, sql).get(params ?? {}) as Record<string, unknown> | undefined) ?? {};
 }
 
-function tryQueryAll(db: Database.Database, sql: string): Record<string, unknown>[] | { error: string } {
+function prepareStatement(db: DatabaseSync, sql: string): ReturnType<DatabaseSync["prepare"]> {
+  const statement = db.prepare(sql);
+  statement.setAllowUnknownNamedParameters(true);
+  return statement;
+}
+
+function runTransaction<T>(db: DatabaseSync, fn: () => T): T {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function tryQueryAll(db: DatabaseSync, sql: string): Record<string, unknown>[] | { error: string } {
   try {
     return queryAll(db, sql);
   } catch (error) {
@@ -1949,7 +1945,7 @@ function fileTripletSizes(dbPath: string): Record<string, unknown> {
   };
 }
 
-function collectSqliteSpaceStats(db: Database.Database): Record<string, unknown> {
+function collectSqliteSpaceStats(db: DatabaseSync): Record<string, unknown> {
   const pageCount = Number(queryOne(db, "PRAGMA page_count").page_count ?? 0);
   const freelistCount = Number(queryOne(db, "PRAGMA freelist_count").freelist_count ?? 0);
   const pageSize = Number(queryOne(db, "PRAGMA page_size").page_size ?? 0);
@@ -2436,7 +2432,9 @@ function printLogsApplySummary(report: Record<string, unknown>): void {
   console.log("\nLogs cleanup:");
   console.log(`  deleted rows: ${String(report.deletedRows ?? 0)}`);
   console.log(`  capped rows: ${String(report.cappedRows ?? 0)}`);
-  console.log(`  remaining cleanup candidates: delete=${String(after.delete_rows ?? 0)} cap=${String(after.cap_rows ?? 0)}`);
+  console.log(
+    `  remaining cleanup candidates: delete=${String(after.delete_rows ?? 0)} cap=${String(after.cap_rows ?? 0)}`,
+  );
   console.log(
     `  estimated savings before apply: delete=${String(before.delete_estimated_payload_mib ?? 0)} MiB cap=${String(
       before.cap_estimated_savings_mib ?? 0,

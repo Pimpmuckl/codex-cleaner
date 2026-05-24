@@ -1,7 +1,7 @@
-import Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, test } from "vitest";
 
 import {
@@ -233,7 +233,7 @@ describe("nextFileBackupPath", () => {
 describe("collectLogCleanupStats", () => {
   test("counts old rows separately from oversized retained log bodies", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
-    const db = new Database(path.join(dir, "logs_2.sqlite"));
+    const db = new DatabaseSync(path.join(dir, "logs_2.sqlite"));
     try {
       db.exec(`
         CREATE TABLE logs (
@@ -317,7 +317,7 @@ describe("checkpointWal", () => {
   test("backs up state_5.sqlite before applying checkpoint", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
     const dbPath = path.join(dir, "state_5.sqlite");
-    const db = new Database(dbPath);
+    const db = new DatabaseSync(dbPath);
     try {
       db.exec("CREATE TABLE state (id INTEGER PRIMARY KEY)");
       db.close();
@@ -327,7 +327,7 @@ describe("checkpointWal", () => {
       expect(typeof report.backupPath).toBe("string");
       expect(fs.existsSync(String(report.backupPath))).toBe(true);
     } finally {
-      if (db.open) db.close();
+      if (db.isOpen) db.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -391,7 +391,7 @@ describe("collectCompactCandidateStats", () => {
   test("ignores recent, protected, and already-small rows", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
     const dbPath = path.join(dir, "state_5.sqlite");
-    const db = new Database(dbPath);
+    const db = new DatabaseSync(dbPath);
     try {
       db.exec(`
         CREATE TABLE threads (
@@ -446,7 +446,7 @@ describe("collectStaleArchiveCandidateStats", () => {
     const sessions = path.join(dir, "sessions");
     fs.mkdirSync(sessions, { recursive: true });
     const dbPath = path.join(dir, "state_5.sqlite");
-    const db = new Database(dbPath);
+    const db = new DatabaseSync(dbPath);
     try {
       db.exec(`
         CREATE TABLE threads (
@@ -504,7 +504,7 @@ describe("orphan rollout archiving", () => {
     const sessions = path.join(dir, "sessions", "2026", "03", "26");
     const archived = path.join(dir, "archived_sessions");
     const dbPath = path.join(dir, "state_5.sqlite");
-    const db = new Database(dbPath);
+    const db = new DatabaseSync(dbPath);
     try {
       fs.mkdirSync(sessions, { recursive: true });
       fs.mkdirSync(archived, { recursive: true });
@@ -569,7 +569,7 @@ describe("orphan rollout archiving", () => {
       expect(Number(report.prunedEmptyDirs)).toBeGreaterThanOrEqual(1);
       expect(fs.existsSync(String(report.manifestPath))).toBe(true);
     } finally {
-      if (db.open) db.close();
+      if (db.isOpen) db.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
