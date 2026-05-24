@@ -369,6 +369,11 @@ async function stopAppServer(child: ChildProcessWithoutNullStreams): Promise<voi
     };
     if (process.platform === "win32") {
       // Windows kill() is forceful; give stdin EOF a brief chance to flush SQLite first.
+      try {
+        child.stdin.end();
+      } catch {
+        // Process may already be closed.
+      }
       timers.push(setTimeout(terminate, APP_SERVER_WINDOWS_TERMINATE_DELAY_MS));
     } else {
       terminate();
@@ -619,7 +624,7 @@ export async function cleanCodex(options: CleanerOptions): Promise<Record<string
   const vacuum = shouldVacuumState ? await vacuumStateDatabase(options, !hasStateBackup) : null;
   const logs = options.pruneLogs ? await cleanLogs(options) : null;
   const tuiLog = options.pruneTuiLog ? await cleanTuiLog(options) : null;
-  const checkpoint = await checkpointWal(options);
+  const checkpoint = await checkpointWal(options, !hasStateBackup);
 
   return {
     action: "clean",
@@ -797,13 +802,20 @@ export function archiveOrphanRollouts(options: CleanerOptions): Record<string, u
   };
 }
 
-export async function checkpointWal(options: CleanerOptions): Promise<Record<string, unknown>> {
+export async function checkpointWal(
+  options: CleanerOptions,
+  backupBeforeCheckpoint = true,
+): Promise<Record<string, unknown>> {
   const codexHome = resolveCodexHome(options);
   const stateDb = path.join(codexHome, "state_5.sqlite");
   const before = fileTripletSizes(stateDb);
   let checkpointResult: unknown = null;
+  let backupPath: string | null = null;
 
   if (options.apply) {
+    if (backupBeforeCheckpoint) {
+      backupPath = await backupSqliteDatabase(stateDb, resolveBackupDir(options, codexHome));
+    }
     const db = openWritableDb(stateDb);
     try {
       checkpointResult = queryAll(db, "PRAGMA wal_checkpoint(TRUNCATE)");
@@ -820,7 +832,7 @@ export async function checkpointWal(options: CleanerOptions): Promise<Record<str
     before,
     after: fileTripletSizes(stateDb),
     checkpointResult,
-    backupPath: null,
+    backupPath,
   };
 }
 
@@ -1422,6 +1434,10 @@ function buildOrphanRolloutPlan(
       skipped.push({ ...move, reason: "recent" });
       continue;
     }
+    if (move.indexed) {
+      skipped.push({ ...move, reason: "session-indexed" });
+      continue;
+    }
     if (fs.existsSync(move.destination)) {
       skipped.push({ ...move, reason: "destination-exists" });
       continue;
@@ -1450,6 +1466,7 @@ function buildOrphanRolloutPlan(
       unindexed_size_mib: fileMoveListSizeMib(unindexed),
       skipped_files: skipped.length,
       skipped_recent_files: skipped.filter((move) => move.reason === "recent").length,
+      skipped_session_indexed_files: skipped.filter((move) => move.reason === "session-indexed").length,
       skipped_destination_exists_files: skipped.filter((move) => move.reason === "destination-exists").length,
       oldest_candidate_modified_utc: millisToIso(minNumberOrNull(modifiedValues)),
       newest_candidate_modified_utc: millisToIso(maxNumberOrNull(modifiedValues)),
@@ -2563,6 +2580,7 @@ function printOrphanRolloutArchiveCandidate(title: string, value: unknown): void
     "unindexed_files",
     "empty_dir_candidates",
     "skipped_recent_files",
+    "skipped_session_indexed_files",
     "skipped_destination_exists_files",
     "oldest_candidate_modified_utc",
     "newest_candidate_modified_utc",

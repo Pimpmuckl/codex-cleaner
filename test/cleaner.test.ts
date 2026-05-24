@@ -11,6 +11,7 @@ import {
   collectTuiLogCleanupStats,
   collectStaleArchiveCandidateStats,
   archiveOrphanRollouts,
+  checkpointWal,
   cleanTuiLog,
   compactWhere,
   nextFileBackupPath,
@@ -312,6 +313,26 @@ describe("TUI log cleanup", () => {
   });
 });
 
+describe("checkpointWal", () => {
+  test("backs up state_5.sqlite before applying checkpoint", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    const dbPath = path.join(dir, "state_5.sqlite");
+    const db = new Database(dbPath);
+    try {
+      db.exec("CREATE TABLE state (id INTEGER PRIMARY KEY)");
+      db.close();
+
+      const report = await checkpointWal(defaultOptions({ apply: true, codexHome: dir }));
+
+      expect(typeof report.backupPath).toBe("string");
+      expect(fs.existsSync(String(report.backupPath))).toBe(true);
+    } finally {
+      if (db.open) db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("backup pruning", () => {
   test("rejects scheduled prune timings that cannot delete backups", async () => {
     await expect(scheduleBackupPrune(defaultOptions({ afterHours: 1, olderThanHours: 48 }))).rejects.toThrow(
@@ -497,30 +518,33 @@ describe("orphan rollout archiving", () => {
       const oldOrphanId = "00000000-0000-4000-8000-000000000002";
       const recentOrphanId = "00000000-0000-4000-8000-000000000003";
       const collisionOrphanId = "00000000-0000-4000-8000-000000000004";
+      const indexedOrphanId = "00000000-0000-4000-8000-000000000005";
       const rollout = (id: string): string => path.join(sessions, `rollout-2026-03-26T00-00-00-${id}.jsonl`);
       const referenced = rollout(referencedId);
       const oldOrphan = rollout(oldOrphanId);
       const recentOrphan = rollout(recentOrphanId);
       const collisionOrphan = rollout(collisionOrphanId);
-      for (const file of [referenced, oldOrphan, recentOrphan, collisionOrphan]) {
+      const indexedOrphan = rollout(indexedOrphanId);
+      for (const file of [referenced, oldOrphan, recentOrphan, collisionOrphan, indexedOrphan]) {
         fs.writeFileSync(file, `{"type":"session_meta","payload":{"id":"${rolloutThreadId(file)}"}}\n`);
       }
       const oldDate = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-      for (const file of [referenced, oldOrphan, collisionOrphan]) {
+      for (const file of [referenced, oldOrphan, collisionOrphan, indexedOrphan]) {
         fs.utimesSync(file, oldDate, oldDate);
       }
       fs.writeFileSync(path.join(archived, path.basename(collisionOrphan)), "already archived");
       fs.writeFileSync(
         path.join(dir, "session_index.jsonl"),
-        `${JSON.stringify({ id: oldOrphanId, thread_name: "old orphan", updated_at: oldDate.toISOString() })}\n`,
+        `${JSON.stringify({ id: indexedOrphanId, thread_name: "indexed orphan", updated_at: oldDate.toISOString() })}\n`,
       );
       db.prepare("INSERT INTO threads VALUES (?, ?)").run(referencedId, referenced);
 
       const cutoffMs = Date.now() - 14 * 24 * 60 * 60 * 1000;
       const stats = collectOrphanRolloutArchiveStats(db, dir, { cutoffMs });
       expect(stats.files).toBe(1);
-      expect(stats.indexed_files).toBe(1);
+      expect(stats.indexed_files).toBe(0);
       expect(stats.skipped_recent_files).toBe(1);
+      expect(stats.skipped_session_indexed_files).toBe(1);
       expect(stats.skipped_destination_exists_files).toBe(1);
       expect(Number(stats.empty_dir_candidates)).toBeGreaterThanOrEqual(1);
       db.close();
@@ -539,6 +563,7 @@ describe("orphan rollout archiving", () => {
       expect(fs.existsSync(path.join(archived, path.basename(oldOrphan)))).toBe(true);
       expect(fs.existsSync(recentOrphan)).toBe(true);
       expect(fs.existsSync(collisionOrphan)).toBe(true);
+      expect(fs.existsSync(indexedOrphan)).toBe(true);
       expect(fs.existsSync(emptySessionDir)).toBe(false);
       expect(fs.existsSync(emptyArchivedDir)).toBe(true);
       expect(Number(report.prunedEmptyDirs)).toBeGreaterThanOrEqual(1);

@@ -358,6 +358,15 @@ function printDryRunSummary(report: Record<string, unknown>): void {
         pc.yellow(`  Skipped ${String(orphanRollouts.skipped_recent_files)} orphan rollouts inside the recent window.`),
       );
     }
+    if (Number(orphanRollouts.skipped_session_indexed_files) > 0) {
+      console.log(
+        pc.yellow(
+          `  Skipped ${String(
+            orphanRollouts.skipped_session_indexed_files,
+          )} DB-orphaned rollouts still present in session_index.jsonl.`,
+        ),
+      );
+    }
   }
   const stateSpace = recordAt(report, "databaseSpace", "state_5.sqlite");
   if (Number(stateSpace.free_mib) >= 1) {
