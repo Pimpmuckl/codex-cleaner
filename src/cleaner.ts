@@ -33,6 +33,14 @@ type BackupFile = {
   path: string;
 };
 
+type BackupPrunePlan = {
+  backupDir: string;
+  candidates: BackupFile[];
+  codexHome: string;
+  cutoffMs: number;
+  files: BackupFile[];
+};
+
 type OrphanRolloutMove = {
   destination: string;
   indexed: boolean;
@@ -384,6 +392,7 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
   const goalsDb = path.join(codexHome, "goals_1.sqlite");
   const globalState = loadGlobalState(codexHome);
   const protection = loadThreadProtection(codexHome, globalState);
+  const protectedIds = allProtectedIds(protection);
   const cutoffMs = recentCutoffMs(options.keepRecentDays);
 
   const report: Record<string, unknown> = {
@@ -410,7 +419,7 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
       pinnedThreads: protection.pinnedIds.size,
       heartbeatThreads: protection.heartbeatIds.size,
       activeGoalThreads: protection.activeGoalIds.size,
-      totalUniqueProtectedThreads: allProtectedIds(protection).size,
+      totalUniqueProtectedThreads: protectedIds.size,
       activeWorkspaceRoots: Array.isArray(globalState["active-workspace-roots"])
         ? globalState["active-workspace-roots"]
         : [],
@@ -428,19 +437,19 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
       cutoffMs,
       maxChars: options.maxChars,
       protectRecent: !options.compactRecentMetadata,
-      protectedIds: allProtectedIds(protection),
+      protectedIds,
     });
     report.compactMetadataCandidatesArchivedOnly = collectCompactCandidateStats(db, {
       archivedOnly: true,
       cutoffMs,
       maxChars: options.maxChars,
       protectRecent: !options.compactRecentMetadata,
-      protectedIds: allProtectedIds(protection),
+      protectedIds,
     });
     if (options.archiveStale) {
       report.staleArchiveCandidates = collectStaleArchiveCandidateStats(db, codexHome, {
         cutoffMs,
-        protectedIds: allProtectedIds(protection),
+        protectedIds,
         statRollouts: options.includeRollouts,
       });
     }
@@ -521,10 +530,7 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
     }
 
     if (options.apply && Number(before.rows) > 0) {
-      backupPath = await backupSqliteDatabase(
-        stateDb,
-        options.backupDir ?? path.join(codexHome, ".codex-cleanup-backups"),
-      );
+      backupPath = await backupSqliteDatabase(stateDb, resolveBackupDir(options, codexHome));
       const where = compactWhere({
         archivedOnly: options.archivedOnly,
         cutoffMs,
@@ -655,10 +661,7 @@ export async function archiveStaleThreads(options: CleanerOptions): Promise<Reco
   let backupPath: string | null = null;
   let appServerResult: Record<string, unknown> | null = null;
   if (options.apply && beforePlan.archiveCallIds.length) {
-    backupPath = await backupSqliteDatabase(
-      stateDb,
-      options.backupDir ?? path.join(codexHome, ".codex-cleanup-backups"),
-    );
+    backupPath = await backupSqliteDatabase(stateDb, resolveBackupDir(options, codexHome));
     appServerResult = await archiveThreadsViaCodexAppServer(
       beforePlan.archiveCallIds,
       options.codexCommand ?? "codex",
@@ -831,7 +834,7 @@ export async function vacuumStateDatabase(
     action: "vacuum-state",
     apply: options.apply,
     backupBeforeVacuum,
-    backupDir: options.backupDir ?? path.join(codexHome, ".codex-cleanup-backups"),
+    backupDir: resolveBackupDir(options, codexHome),
     codexHome,
     dbPath: stateDb,
   });
@@ -865,10 +868,7 @@ export async function cleanLogs(options: CleanerOptions): Promise<Record<string,
     const hasRowChanges = Number(before.cap_rows) > 0 || Number(before.delete_rows) > 0;
     const shouldVacuum = Number(beforeSpace.freelist_count) > 0 || hasRowChanges;
     if (options.apply && shouldVacuum) {
-      backupPath = await backupSqliteDatabase(
-        logsDb,
-        options.backupDir ?? path.join(codexHome, ".codex-cleanup-backups"),
-      );
+      backupPath = await backupSqliteDatabase(logsDb, resolveBackupDir(options, codexHome));
       const cutoffSeconds = logCutoffSeconds(options.keepLogDays);
       if (hasRowChanges) {
         const tx = db.transaction(() => {
@@ -935,7 +935,7 @@ export async function cleanTuiLog(options: CleanerOptions): Promise<Record<strin
   let truncatedBytes = 0;
 
   if (options.apply && before.exists && Number(before.reclaimable_bytes) > 0) {
-    backupPath = backupRegularFile(logPath, options.backupDir ?? path.join(codexHome, ".codex-cleanup-backups"));
+    backupPath = backupRegularFile(logPath, resolveBackupDir(options, codexHome));
     truncateFileToTail(logPath, Number(before.keep_bytes));
     truncatedBytes = Number(before.reclaimable_bytes);
   }
@@ -957,26 +957,22 @@ export async function cleanTuiLog(options: CleanerOptions): Promise<Record<strin
 }
 
 export function scanBackups(options: CleanerOptions): Record<string, unknown> {
-  const codexHome = resolveCodexHome(options);
-  const backupDir = resolveBackupDir(options, codexHome);
-  const cutoffMs = Date.now() - options.olderThanHours * 60 * 60 * 1000;
-  const files = listBackupFiles(backupDir);
-  const candidates = files.filter((file) => Date.parse(file.lastModified) < cutoffMs);
+  const plan = buildBackupPrunePlan(options);
 
   return {
     action: "backups-scan",
     mode: "dry-run",
-    codexHome,
+    codexHome: plan.codexHome,
     generatedAt: new Date().toISOString(),
     policy: {
       olderThanHours: options.olderThanHours,
-      cutoffMs,
-      cutoffUtc: millisToIso(cutoffMs),
+      cutoffMs: plan.cutoffMs,
+      cutoffUtc: millisToIso(plan.cutoffMs),
     },
-    backupDir,
-    files: backupFileStats(files),
-    pruneCandidates: backupFileStats(candidates),
-    sample: candidates.slice(0, 10),
+    backupDir: plan.backupDir,
+    files: backupFileStats(plan.files),
+    pruneCandidates: backupFileStats(plan.candidates),
+    sample: plan.candidates.slice(0, 10),
   };
 }
 
@@ -985,14 +981,12 @@ export function pruneBackups(options: CleanerOptions): Record<string, unknown> {
     throw new Error("--apply requires --confirm-delete-backups");
   }
 
-  const before = scanBackups(options);
-  const candidates = backupFilesFromReport(before.pruneCandidates);
+  const before = buildBackupPrunePlan(options);
   const deleted: BackupFile[] = [];
   if (options.apply) {
-    const backupDir = String(before.backupDir);
-    for (const file of candidates) {
+    for (const file of before.candidates) {
       const resolved = path.resolve(file.path);
-      if (path.dirname(resolved) !== backupDir) {
+      if (path.dirname(resolved) !== before.backupDir) {
         throw new Error(`Refusing to delete backup outside backup dir: ${file.path}`);
       }
       fs.unlinkSync(resolved);
@@ -1000,17 +994,21 @@ export function pruneBackups(options: CleanerOptions): Record<string, unknown> {
     }
   }
 
-  const after = scanBackups(options);
+  const after = buildBackupPrunePlan(options);
   return {
     action: "backups-prune",
     mode: options.apply ? "apply" : "dry-run",
     codexHome: before.codexHome,
     generatedAt: new Date().toISOString(),
-    policy: before.policy,
+    policy: {
+      olderThanHours: options.olderThanHours,
+      cutoffMs: before.cutoffMs,
+      cutoffUtc: millisToIso(before.cutoffMs),
+    },
     backupDir: before.backupDir,
-    before: before.files,
-    candidates: before.pruneCandidates,
-    after: after.files,
+    before: backupFileStats(before.files),
+    candidates: backupFileStats(before.candidates),
+    after: backupFileStats(after.files),
     deleted: backupFileStats(deleted),
   };
 }
@@ -1582,6 +1580,20 @@ function listBackupFiles(backupDir: string): BackupFile[] {
     .sort((left, right) => Date.parse(left.lastModified) - Date.parse(right.lastModified));
 }
 
+function buildBackupPrunePlan(options: CleanerOptions): BackupPrunePlan {
+  const codexHome = resolveCodexHome(options);
+  const backupDir = resolveBackupDir(options, codexHome);
+  const cutoffMs = Date.now() - options.olderThanHours * 60 * 60 * 1000;
+  const files = listBackupFiles(backupDir);
+  return {
+    backupDir,
+    candidates: files.filter((file) => Date.parse(file.lastModified) < cutoffMs),
+    codexHome,
+    cutoffMs,
+    files,
+  };
+}
+
 function backupFileStats(files: BackupFile[]): Record<string, unknown> {
   const totalBytes = files.reduce((sum, file) => sum + file.bytes, 0);
   return {
@@ -1592,22 +1604,6 @@ function backupFileStats(files: BackupFile[]): Record<string, unknown> {
     totalBytes,
     totalMib: roundMib(totalBytes),
   };
-}
-
-function backupFilesFromReport(value: unknown): BackupFile[] {
-  const files = asRecord(value).files;
-  if (!Array.isArray(files)) return [];
-  return files
-    .map((file) => asRecord(file))
-    .filter((file) => typeof file.path === "string")
-    .map((file) => ({
-      ageHours: Number(file.ageHours ?? 0),
-      bytes: Number(file.bytes ?? 0),
-      lastModified: String(file.lastModified ?? ""),
-      mib: Number(file.mib ?? 0),
-      name: String(file.name ?? path.basename(String(file.path))),
-      path: String(file.path),
-    }));
 }
 
 async function backupSqliteDatabase(dbPath: string, backupDir: string): Promise<string> {
