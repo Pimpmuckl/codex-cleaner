@@ -748,10 +748,7 @@ export function archiveOrphanRollouts(options: CleanerOptions): Record<string, u
         });
       }
     }
-    prunedEmptyDirs = [
-      ...pruneEmptyDirectories(path.join(codexHome, "sessions")),
-      ...pruneEmptyDirectories(path.join(codexHome, "archived_sessions")),
-    ];
+    prunedEmptyDirs = pruneEmptyDirectories(path.join(codexHome, "sessions"));
     writeJsonFile(manifestPath, {
       action: "archive-orphan-rollouts",
       generatedAt: new Date().toISOString(),
@@ -1432,10 +1429,7 @@ function buildOrphanRolloutPlan(
   }
 
   const candidatePaths = new Set(candidates.map((move) => normalizePath(move.path)));
-  const emptyDirs = [
-    ...collectEmptyDirectories(sessionsRoot, candidatePaths),
-    ...collectEmptyDirectories(archivedRoot),
-  ];
+  const emptyDirs = collectEmptyDirectories(sessionsRoot, candidatePaths);
   const indexed = candidates.filter((move) => move.indexed);
   const unindexed = candidates.filter((move) => !move.indexed);
   const modifiedValues = candidates.map((move) => move.modifiedMs);
@@ -1669,48 +1663,30 @@ async function vacuumSqliteDatabase(args: {
 }
 
 export function nextBackupPath(dbPath: string, backupDir: string, now = new Date()): string {
-  const stamp = now
-    .toISOString()
-    .replace(/[-:]/g, "")
-    .replace(".", "_");
-  const base = `${path.basename(dbPath)}.${stamp}`;
-  let backupPath = path.join(backupDir, `${base}.bak.sqlite`);
-  let suffix = 2;
-  while (fs.existsSync(backupPath)) {
-    backupPath = path.join(backupDir, `${base}.${String(suffix)}.bak.sqlite`);
-    suffix += 1;
-  }
-  return backupPath;
+  return nextTimestampedPath(backupDir, path.basename(dbPath), ".bak.sqlite", now);
 }
 
 export function nextFileBackupPath(filePath: string, backupDir: string, now = new Date()): string {
-  const stamp = now
-    .toISOString()
-    .replace(/[-:]/g, "")
-    .replace(".", "_");
-  const base = `${path.basename(filePath)}.${stamp}`;
-  let backupPath = path.join(backupDir, `${base}.bak`);
-  let suffix = 2;
-  while (fs.existsSync(backupPath)) {
-    backupPath = path.join(backupDir, `${base}.${String(suffix)}.bak`);
-    suffix += 1;
-  }
-  return backupPath;
+  return nextTimestampedPath(backupDir, path.basename(filePath), ".bak", now);
 }
 
 function nextOrphanRolloutManifestPath(backupDir: string, now = new Date()): string {
+  return nextTimestampedPath(backupDir, "orphan-rollouts", ".manifest.bak", now);
+}
+
+function nextTimestampedPath(backupDir: string, name: string, suffix: string, now: Date): string {
   const stamp = now
     .toISOString()
     .replace(/[-:]/g, "")
     .replace(".", "_");
-  const base = `orphan-rollouts.${stamp}.manifest`;
-  let manifestPath = path.join(backupDir, `${base}.bak`);
-  let suffix = 2;
-  while (fs.existsSync(manifestPath)) {
-    manifestPath = path.join(backupDir, `${base}.${String(suffix)}.bak`);
-    suffix += 1;
+  const base = `${name}.${stamp}`;
+  let candidate = path.join(backupDir, `${base}${suffix}`);
+  let collision = 2;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(backupDir, `${base}.${String(collision)}${suffix}`);
+    collision += 1;
   }
-  return manifestPath;
+  return candidate;
 }
 
 function writeJsonFile(filePath: string, value: unknown): void {
@@ -2355,7 +2331,7 @@ function printCleanApplySummary(report: Record<string, unknown>): void {
   const checkpoint = asRecord(report.checkpoint);
 
   printArchiveApplySummary(archive);
-  printOrphanRolloutApplySummary(orphanRollouts);
+  printOrphanRolloutSummary(orphanRollouts);
   printCompactApplySummary(compact);
   printVacuumSummary("State vacuum", vacuum);
   printLogsApplySummary(logs);
@@ -2405,10 +2381,6 @@ function printOrphanRolloutSummary(report: Record<string, unknown>): void {
     console.log(`  errors: ${String((report.errors as unknown[]).length)}`);
   }
   if (report.manifestPath) console.log(`  manifest: ${String(report.manifestPath)}`);
-}
-
-function printOrphanRolloutApplySummary(report: Record<string, unknown>): void {
-  printOrphanRolloutSummary(report);
 }
 
 function printCompactApplySummary(report: Record<string, unknown>): void {

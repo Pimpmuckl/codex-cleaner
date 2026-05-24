@@ -21,6 +21,39 @@ import {
   scanBackups,
   truncateFileToTail,
 } from "../src/cleaner.js";
+import type { CleanerOptions } from "../src/types.js";
+
+function defaultOptions(overrides: Partial<CleanerOptions> = {}): CleanerOptions {
+  return {
+    allowRunningReadonly: false,
+    allowRunningOrphanRolloutArchive: false,
+    afterHours: 48,
+    apply: false,
+    archiveOrphanRollouts: false,
+    archiveStale: true,
+    archivedOnly: false,
+    compactRecentMetadata: false,
+    confirmArchiveStale: false,
+    confirmArchiveOrphanRollouts: false,
+    confirmDeleteBackups: false,
+    confirmLossyMetadata: false,
+    confirmPruneLogs: false,
+    confirmPruneTuiLog: false,
+    confirmScheduleBackupPrune: false,
+    includeLogs: false,
+    includeRollouts: false,
+    json: false,
+    keepLogDays: 7,
+    keepRecentDays: 14,
+    keepTuiLogMib: 16,
+    maxChars: 1024,
+    maxLogBodyChars: 4096,
+    olderThanHours: 48,
+    pruneLogs: false,
+    pruneTuiLog: false,
+    ...overrides,
+  };
+}
 
 describe("rolloutThreadId", () => {
   test("extracts UUID from rollout filename", () => {
@@ -223,34 +256,14 @@ describe("collectLogCleanupStats", () => {
       insert.run(Math.floor(Date.now() / 1000), "x".repeat(50), 50);
       insert.run(Math.floor(Date.now() / 1000), "y".repeat(200000), 200000);
 
-      const stats = collectLogCleanupStats(db, {
-        allowRunningReadonly: false,
-        allowRunningOrphanRolloutArchive: false,
-        afterHours: 48,
-        apply: false,
-        archiveOrphanRollouts: false,
-        archiveStale: true,
-        archivedOnly: false,
-        confirmDeleteBackups: false,
-        confirmArchiveStale: false,
-        confirmArchiveOrphanRollouts: false,
-        compactRecentMetadata: false,
-        confirmLossyMetadata: false,
-        confirmPruneLogs: false,
-        confirmPruneTuiLog: false,
-        confirmScheduleBackupPrune: false,
-        includeLogs: true,
-        includeRollouts: false,
-        json: false,
-        keepLogDays: 7,
-        keepRecentDays: 14,
-        keepTuiLogMib: 16,
-        maxChars: 1024,
-        maxLogBodyChars: 100,
-        olderThanHours: 48,
-        pruneLogs: true,
-        pruneTuiLog: false,
-      });
+      const stats = collectLogCleanupStats(
+        db,
+        defaultOptions({
+          includeLogs: true,
+          maxLogBodyChars: 100,
+          pruneLogs: true,
+        }),
+      );
 
       expect(stats.delete_rows).toBe(1);
       expect(stats.cap_rows).toBe(1);
@@ -279,35 +292,15 @@ describe("TUI log cleanup", () => {
       expect(fs.readFileSync(logPath, "utf8")).toBe("6789");
 
       fs.writeFileSync(logPath, Buffer.concat([Buffer.alloc(1024 * 1024, "a"), Buffer.from("tail")]));
-      const report = await cleanTuiLog({
-        allowRunningReadonly: false,
-        allowRunningOrphanRolloutArchive: false,
-        afterHours: 48,
-        apply: true,
-        archiveOrphanRollouts: false,
-        archiveStale: true,
-        archivedOnly: false,
-        codexHome: dir,
-        compactRecentMetadata: false,
-        confirmArchiveStale: false,
-        confirmArchiveOrphanRollouts: false,
-        confirmDeleteBackups: false,
-        confirmLossyMetadata: false,
-        confirmPruneLogs: false,
-        confirmPruneTuiLog: true,
-        confirmScheduleBackupPrune: false,
-        includeLogs: false,
-        includeRollouts: false,
-        json: false,
-        keepLogDays: 7,
-        keepRecentDays: 14,
-        keepTuiLogMib: 1,
-        maxChars: 1024,
-        maxLogBodyChars: 4096,
-        olderThanHours: 48,
-        pruneLogs: false,
-        pruneTuiLog: true,
-      });
+      const report = await cleanTuiLog(
+        defaultOptions({
+          apply: true,
+          codexHome: dir,
+          confirmPruneTuiLog: true,
+          keepTuiLogMib: 1,
+          pruneTuiLog: true,
+        }),
+      );
 
       expect(fs.statSync(logPath).size).toBe(1024 * 1024);
       expect(fs.readFileSync(logPath).subarray(-4).toString()).toBe("tail");
@@ -333,70 +326,24 @@ describe("backup pruning", () => {
       const oldDate = new Date(Date.now() - 50 * 60 * 60 * 1000);
       fs.utimesSync(oldBackup, oldDate, oldDate);
 
-      const scan = scanBackups({
-        allowRunningReadonly: false,
-        allowRunningOrphanRolloutArchive: false,
-        afterHours: 48,
-        apply: false,
-        archiveOrphanRollouts: false,
-        archiveStale: true,
-        archivedOnly: false,
-        backupDir,
-        codexHome: dir,
-        compactRecentMetadata: false,
-        confirmArchiveStale: false,
-        confirmArchiveOrphanRollouts: false,
-        confirmDeleteBackups: false,
-        confirmLossyMetadata: false,
-        confirmPruneLogs: false,
-        confirmPruneTuiLog: false,
-        confirmScheduleBackupPrune: false,
-        includeLogs: false,
-        includeRollouts: false,
-        json: false,
-        keepLogDays: 7,
-        keepRecentDays: 14,
-        keepTuiLogMib: 16,
-        maxChars: 1024,
-        maxLogBodyChars: 4096,
-        olderThanHours: 48,
-        pruneLogs: false,
-        pruneTuiLog: false,
-      });
+      const scan = scanBackups(
+        defaultOptions({
+          backupDir,
+          codexHome: dir,
+        }),
+      );
 
       expect((scan.files as Record<string, unknown>).count).toBe(2);
       expect((scan.pruneCandidates as Record<string, unknown>).count).toBe(1);
 
-      const report = pruneBackups({
-        allowRunningReadonly: false,
-        allowRunningOrphanRolloutArchive: false,
-        afterHours: 48,
-        apply: true,
-        archiveOrphanRollouts: false,
-        archiveStale: true,
-        archivedOnly: false,
-        backupDir,
-        codexHome: dir,
-        compactRecentMetadata: false,
-        confirmArchiveStale: false,
-        confirmArchiveOrphanRollouts: false,
-        confirmDeleteBackups: true,
-        confirmLossyMetadata: false,
-        confirmPruneLogs: false,
-        confirmPruneTuiLog: false,
-        confirmScheduleBackupPrune: false,
-        includeLogs: false,
-        includeRollouts: false,
-        json: false,
-        keepLogDays: 7,
-        keepRecentDays: 14,
-        keepTuiLogMib: 16,
-        maxChars: 1024,
-        maxLogBodyChars: 4096,
-        olderThanHours: 48,
-        pruneLogs: false,
-        pruneTuiLog: false,
-      });
+      const report = pruneBackups(
+        defaultOptions({
+          apply: true,
+          backupDir,
+          codexHome: dir,
+          confirmDeleteBackups: true,
+        }),
+      );
 
       expect((report.deleted as Record<string, unknown>).count).toBe(1);
       expect(fs.existsSync(oldBackup)).toBe(false);
@@ -564,38 +511,17 @@ describe("orphan rollout archiving", () => {
       expect(stats.indexed_files).toBe(1);
       expect(stats.skipped_recent_files).toBe(1);
       expect(stats.skipped_destination_exists_files).toBe(1);
-      expect(Number(stats.empty_dir_candidates)).toBeGreaterThanOrEqual(2);
+      expect(Number(stats.empty_dir_candidates)).toBeGreaterThanOrEqual(1);
       db.close();
 
-      const report = archiveOrphanRollouts({
-        allowRunningReadonly: false,
-        allowRunningOrphanRolloutArchive: false,
-        afterHours: 48,
-        apply: true,
-        archiveOrphanRollouts: true,
-        archiveStale: true,
-        archivedOnly: false,
-        codexHome: dir,
-        compactRecentMetadata: false,
-        confirmArchiveStale: false,
-        confirmArchiveOrphanRollouts: true,
-        confirmDeleteBackups: false,
-        confirmLossyMetadata: false,
-        confirmPruneLogs: false,
-        confirmPruneTuiLog: false,
-        confirmScheduleBackupPrune: false,
-        includeLogs: false,
-        includeRollouts: false,
-        json: false,
-        keepLogDays: 7,
-        keepRecentDays: 14,
-        keepTuiLogMib: 16,
-        maxChars: 1024,
-        maxLogBodyChars: 4096,
-        olderThanHours: 48,
-        pruneLogs: false,
-        pruneTuiLog: false,
-      });
+      const report = archiveOrphanRollouts(
+        defaultOptions({
+          apply: true,
+          archiveOrphanRollouts: true,
+          codexHome: dir,
+          confirmArchiveOrphanRollouts: true,
+        }),
+      );
 
       expect(report.movedFiles).toBe(1);
       expect(fs.existsSync(oldOrphan)).toBe(false);
@@ -603,8 +529,8 @@ describe("orphan rollout archiving", () => {
       expect(fs.existsSync(recentOrphan)).toBe(true);
       expect(fs.existsSync(collisionOrphan)).toBe(true);
       expect(fs.existsSync(emptySessionDir)).toBe(false);
-      expect(fs.existsSync(emptyArchivedDir)).toBe(false);
-      expect(Number(report.prunedEmptyDirs)).toBeGreaterThanOrEqual(2);
+      expect(fs.existsSync(emptyArchivedDir)).toBe(true);
+      expect(Number(report.prunedEmptyDirs)).toBeGreaterThanOrEqual(1);
       expect(fs.existsSync(String(report.manifestPath))).toBe(true);
     } finally {
       if (db.open) db.close();
