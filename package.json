@@ -1,6 +1,6 @@
 {
   "name": "codex-cleaner",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Guarded cleanup and compaction utility for local Codex state.",
   "license": "MIT",
   "type": "module",
