@@ -20,13 +20,6 @@ export type CleanerOptions = {
   codexCommand?: string;
   codexHome?: string;
   compactRecentMetadata: boolean;
-  confirmArchiveStale: boolean;
-  confirmArchiveOrphanRollouts: boolean;
-  confirmDeleteBackups: boolean;
-  confirmLossyMetadata: boolean;
-  confirmPruneLogs: boolean;
-  confirmPruneTuiLog: boolean;
-  confirmScheduleBackupPrune: boolean;
   includeLogs: boolean;
   includeRollouts: boolean;
   json: boolean;

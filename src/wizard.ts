@@ -7,7 +7,6 @@ import {
   cleanCodex,
   findBlockingProcesses,
   requireStoppedOrReadonlyAllowed,
-  scheduleBackupPrune,
 } from "./cleaner.js";
 import type { CleanerOptions } from "./types.js";
 
@@ -34,47 +33,12 @@ export async function runWizard(options: CleanerOptions): Promise<number> {
   }
 
   const wizardMode = await askWizardMode();
-  const keepRecentDays =
-    wizardMode === "recommended" ? options.keepRecentDays : await askKeepRecentDays(options.keepRecentDays);
-  const maxChars = wizardMode === "recommended" ? options.maxChars : await askMaxChars(options.maxChars);
-  const compactRecentMetadata = wizardMode === "recommended" ? false : await askCompactRecentMetadata();
-  const archiveStale = wizardMode === "recommended" ? true : await askArchiveStale();
-  const archiveOrphanRollouts = wizardMode === "recommended" ? true : await askArchiveOrphanRollouts();
-  const pruneLogs = wizardMode === "recommended" ? true : await askPruneLogs();
-  const pruneTuiLog = wizardMode === "recommended" ? true : await askPruneTuiLog();
-  const includeRollouts =
-    wizardMode === "recommended"
-      ? false
-      : await confirm({
-          default: false,
-          message: "Also scan orphan rollout files? This is slower and stays dry-run only.",
-        });
+  const dryRunOptions =
+    wizardMode === "recommended" ? recommendedWizardOptions(options) : await customWizardOptions(options);
   const runDryRun = await confirm({
     default: true,
     message: "Run the dry-run scan now?",
   });
-
-  const dryRunOptions: CleanerOptions = {
-    ...options,
-    allowRunningReadonly: true,
-    archiveOrphanRollouts,
-    archiveStale,
-    apply: false,
-    archivedOnly: false,
-    compactRecentMetadata,
-    confirmArchiveStale: false,
-    confirmArchiveOrphanRollouts: false,
-    confirmLossyMetadata: false,
-    confirmPruneLogs: false,
-    confirmPruneTuiLog: false,
-    includeLogs: false,
-    includeRollouts,
-    pruneLogs,
-    pruneTuiLog,
-    keepRecentDays,
-    maxChars,
-    json: false,
-  };
 
   if (!runDryRun) {
     printDryRunCommand(dryRunOptions);
@@ -89,7 +53,9 @@ export async function runWizard(options: CleanerOptions): Promise<number> {
   const archiveRows = numberAt(report, "staleArchiveCandidates", "archive_call_rows");
   const orphanRolloutRows = numberAt(report, "orphanRolloutArchiveCandidates", "files");
   const logRows =
-    numberAt(report, "logCleanupCandidates", "delete_rows") + numberAt(report, "logCleanupCandidates", "cap_rows");
+    numberAt(report, "logCleanupCandidates", "delete_rows") +
+    numberAt(report, "logCleanupCandidates", "target_prune_rows") +
+    numberAt(report, "logCleanupCandidates", "cap_rows");
   const tuiLogMib = numberAt(report, "tuiLogCleanupCandidates", "reclaimable_mib");
   const vacuumMib = numberAt(report, "databaseSpace", "state_5.sqlite", "free_mib");
   if (!compactRows && !archiveRows && !orphanRolloutRows && !logRows && !tuiLogMib && vacuumMib < 1) {
@@ -109,11 +75,6 @@ export async function runWizard(options: CleanerOptions): Promise<number> {
   const applyReport = await cleanCodex({
     ...dryRunOptions,
     apply: true,
-    confirmArchiveStale: true,
-    confirmArchiveOrphanRollouts: true,
-    confirmLossyMetadata: true,
-    confirmPruneLogs: true,
-    confirmPruneTuiLog: true,
   });
   printApplySummary(
     recordAt(applyReport, "compact"),
@@ -123,9 +84,57 @@ export async function runWizard(options: CleanerOptions): Promise<number> {
     nullableRecordAt(applyReport, "logs"),
     nullableRecordAt(applyReport, "tuiLog"),
     recordAt(applyReport, "checkpoint"),
+    nullableRecordAt(applyReport, "backupPruneSchedule"),
   );
-  await offerScheduledBackupCleanup(dryRunOptions, applyReport);
   return 0;
+}
+
+export function recommendedWizardOptions(options: CleanerOptions): CleanerOptions {
+  return {
+    ...options,
+    allowRunningReadonly: true,
+    archiveOrphanRollouts: true,
+    archiveStale: true,
+    apply: false,
+    archivedOnly: false,
+    compactRecentMetadata: false,
+    includeLogs: false,
+    includeRollouts: false,
+    json: false,
+    pruneLogs: true,
+    pruneTuiLog: true,
+  };
+}
+
+async function customWizardOptions(options: CleanerOptions): Promise<CleanerOptions> {
+  const keepRecentDays = await askKeepRecentDays(options.keepRecentDays);
+  const maxChars = await askMaxChars(options.maxChars);
+  const compactRecentMetadata = await askCompactRecentMetadata();
+  const archiveStale = await askArchiveStale();
+  const archiveOrphanRollouts = await askArchiveOrphanRollouts();
+  const pruneLogs = await askPruneLogs();
+  const pruneTuiLog = await askPruneTuiLog();
+  const includeRollouts = await confirm({
+    default: false,
+    message: "Also scan orphan rollout files? This is slower and stays dry-run only.",
+  });
+
+  return {
+    ...options,
+    allowRunningReadonly: true,
+    archiveOrphanRollouts,
+    archiveStale,
+    apply: false,
+    archivedOnly: false,
+    compactRecentMetadata,
+    includeLogs: false,
+    includeRollouts,
+    json: false,
+    keepRecentDays,
+    maxChars,
+    pruneLogs,
+    pruneTuiLog,
+  };
 }
 
 async function waitForApplyConfirmation(): Promise<boolean> {
@@ -382,7 +391,9 @@ function printDryRunSummary(report: Record<string, unknown>): void {
   if (Object.keys(logCleanup).length) {
     console.log(
       pc.green(
-        `  Logs cleanup: delete ${String(logCleanup.delete_rows)} old rows and cap ${String(
+        `  Logs cleanup: delete ${String(logCleanup.delete_rows)} old rows, delete ${String(
+          logCleanup.target_prune_rows ?? 0,
+        )} noisy rows, and cap ${String(
           logCleanup.cap_rows,
         )} oversized log payloads`,
       ),
@@ -420,6 +431,7 @@ function printApplySummary(
   logsReport: Record<string, unknown> | null,
   tuiLogReport: Record<string, unknown> | null,
   checkpointReport: Record<string, unknown>,
+  backupPruneSchedule: Record<string, unknown> | null,
 ): void {
   const before = recordAt(report, "before");
   const after = recordAt(report, "after");
@@ -473,6 +485,7 @@ function printApplySummary(
   const checkpointBefore = recordAt(checkpointReport, "before", "wal");
   const checkpointAfter = recordAt(checkpointReport, "after", "wal");
   console.log(`  WAL checkpoint: ${formatMib(checkpointBefore.mib)} -> ${formatMib(checkpointAfter.mib)}`);
+  printBackupPruneSchedule(backupPruneSchedule);
   const backupPaths = [archiveReport, vacuumReport, logsReport, tuiLogReport, report]
     .map((entry) => entry?.backupPath)
     .filter((value) => typeof value === "string");
@@ -485,41 +498,13 @@ function printApplySummary(
   }
 }
 
-async function offerScheduledBackupCleanup(
-  options: CleanerOptions,
-  applyReport: Record<string, unknown>,
-): Promise<void> {
-  const backupPaths = [
-    nullableRecordAt(applyReport, "archive"),
-    recordAt(applyReport, "compact"),
-    recordAt(applyReport, "vacuum"),
-    nullableRecordAt(applyReport, "logs"),
-    nullableRecordAt(applyReport, "tuiLog"),
-  ]
-    .map((entry) => entry?.backupPath)
-    .filter((value) => typeof value === "string");
-  if (!backupPaths.length) return;
-
-  const schedule = await confirm({
-    default: false,
-    message: `Schedule backup cleanup in ${options.afterHours} hours? You can cancel it before then.`,
-  });
-  if (!schedule) return;
-
-  let report: Record<string, unknown>;
-  try {
-    report = await scheduleBackupPrune({
-      ...options,
-      apply: true,
-      confirmScheduleBackupPrune: true,
-    });
-  } catch (error) {
-    console.log(
-      pc.yellow(`Could not schedule backup cleanup: ${error instanceof Error ? error.message : String(error)}`),
-    );
+function printBackupPruneSchedule(report: Record<string, unknown> | null): void {
+  if (!report) return;
+  console.log(pc.bold("\nBackup cleanup scheduled"));
+  if (report.error) {
+    console.log(pc.yellow(`  Could not schedule automatically: ${String(report.error)}`));
     return;
   }
-  console.log(pc.bold("\nBackup cleanup scheduled"));
   console.log(`  Runs: ${String(recordAt(report, "policy").runAtUtc)}`);
   console.log(`  Command: ${String(report.command)}`);
   if (report.taskName) console.log(`  Task: ${String(report.taskName)}`);
@@ -539,15 +524,13 @@ function printDryRunCommand(options: CleanerOptions): void {
 }
 
 function printApplyCommand(options: CleanerOptions): void {
-  const archiveFlags = options.archiveStale ? " --confirm-archive-stale" : " --skip-archive-stale";
-  const orphanFlags = options.archiveOrphanRollouts
-    ? " --archive-orphan-rollouts --confirm-archive-orphan-rollouts"
-    : "";
-  const logsFlags = options.pruneLogs ? " --prune-logs --confirm-prune-logs" : "";
-  const tuiLogFlags = options.pruneTuiLog ? " --prune-tui-log --confirm-prune-tui-log" : "";
+  const archiveFlags = options.archiveStale ? "" : " --skip-archive-stale";
+  const orphanFlags = options.archiveOrphanRollouts ? " --archive-orphan-rollouts" : "";
+  const logsFlags = options.pruneLogs ? " --prune-logs" : "";
+  const tuiLogFlags = options.pruneTuiLog ? " --prune-tui-log" : "";
   const recentFlag = options.compactRecentMetadata ? " --compact-recent-metadata" : "";
   console.log(
-    `  npx codex-cleaner@latest clean --max-chars ${options.maxChars} --keep-recent-days ${options.keepRecentDays} --apply --confirm-lossy-metadata${archiveFlags}${orphanFlags}${logsFlags}${tuiLogFlags}${recentFlag}`,
+    `  npx codex-cleaner@latest clean --max-chars ${options.maxChars} --keep-recent-days ${options.keepRecentDays} --apply${archiveFlags}${orphanFlags}${logsFlags}${tuiLogFlags}${recentFlag}`,
   );
 }
 

@@ -12,6 +12,8 @@ import {
   collectStaleArchiveCandidateStats,
   archiveOrphanRollouts,
   checkpointWal,
+  cleanCodex,
+  cleanLogs,
   cleanTuiLog,
   compactWhere,
   nextFileBackupPath,
@@ -24,6 +26,7 @@ import {
   truncateFileToTail,
 } from "../src/cleaner.js";
 import type { CleanerOptions } from "../src/types.js";
+import { recommendedWizardOptions } from "../src/wizard.js";
 
 function defaultOptions(overrides: Partial<CleanerOptions> = {}): CleanerOptions {
   return {
@@ -35,13 +38,6 @@ function defaultOptions(overrides: Partial<CleanerOptions> = {}): CleanerOptions
     archiveStale: true,
     archivedOnly: false,
     compactRecentMetadata: false,
-    confirmArchiveStale: false,
-    confirmArchiveOrphanRollouts: false,
-    confirmDeleteBackups: false,
-    confirmLossyMetadata: false,
-    confirmPruneLogs: false,
-    confirmPruneTuiLog: false,
-    confirmScheduleBackupPrune: false,
     includeLogs: false,
     includeRollouts: false,
     json: false,
@@ -56,6 +52,19 @@ function defaultOptions(overrides: Partial<CleanerOptions> = {}): CleanerOptions
     ...overrides,
   };
 }
+
+describe("recommendedWizardOptions", () => {
+  test("enables the no-flag cleanup path", () => {
+    const options = recommendedWizardOptions(defaultOptions());
+
+    expect(options.apply).toBe(false);
+    expect(options.allowRunningReadonly).toBe(true);
+    expect(options.archiveOrphanRollouts).toBe(true);
+    expect(options.archiveStale).toBe(true);
+    expect(options.pruneLogs).toBe(true);
+    expect(options.pruneTuiLog).toBe(true);
+  });
+});
 
 describe("rolloutThreadId", () => {
   test("extracts UUID from rollout filename", () => {
@@ -252,11 +261,12 @@ describe("collectLogCleanupStats", () => {
         )
       `);
       const insert = db.prepare(
-        "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, estimated_bytes) VALUES (?, 0, 'INFO', 'target', ?, ?)",
+        "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, estimated_bytes) VALUES (?, 0, 'INFO', ?, ?, ?)",
       );
-      insert.run(100, "old body".repeat(100), 1000);
-      insert.run(Math.floor(Date.now() / 1000), "x".repeat(50), 50);
-      insert.run(Math.floor(Date.now() / 1000), "y".repeat(200000), 200000);
+      insert.run(100, "target", "old body".repeat(100), 1000);
+      insert.run(Math.floor(Date.now() / 1000), "target", "x".repeat(50), 50);
+      insert.run(Math.floor(Date.now() / 1000), "target", "y".repeat(200000), 200000);
+      insert.run(Math.floor(Date.now() / 1000), "codex_otel.log_only", "noisy", 100);
 
       const stats = collectLogCleanupStats(
         db,
@@ -268,10 +278,71 @@ describe("collectLogCleanupStats", () => {
       );
 
       expect(stats.delete_rows).toBe(1);
+      expect(stats.target_prune_rows).toBe(1);
       expect(stats.cap_rows).toBe(1);
       expect(stats.cap_estimated_savings_mib).toBeGreaterThan(0);
     } finally {
       db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("prunes noisy persistent log targets before capping retained bodies", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    const dbPath = path.join(dir, "logs_2.sqlite");
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`
+        CREATE TABLE logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER NOT NULL,
+          ts_nanos INTEGER NOT NULL,
+          level TEXT NOT NULL,
+          target TEXT NOT NULL,
+          feedback_log_body TEXT,
+          module_path TEXT,
+          file TEXT,
+          line INTEGER,
+          thread_id TEXT,
+          process_uuid TEXT,
+          estimated_bytes INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      const insert = db.prepare(
+        "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, estimated_bytes) VALUES (?, 0, ?, ?, ?, ?)",
+      );
+      const recent = Math.floor(Date.now() / 1000);
+      insert.run(100, "INFO", "keep", "old", 3);
+      insert.run(recent, "TRACE", "log", "x".repeat(200000), 200000);
+      insert.run(recent, "INFO", "keep", "y".repeat(200000), 200000);
+      insert.run(recent, "INFO", "keep", "small", 5);
+      db.close();
+
+      const report = await cleanLogs(
+        defaultOptions({
+          apply: true,
+          codexHome: dir,
+          maxLogBodyChars: 100,
+          pruneLogs: true,
+        }),
+      );
+
+      const after = new DatabaseSync(dbPath);
+      try {
+        expect(report.deletedRows).toBe(2);
+        expect(report.cappedRows).toBe(1);
+        expect(after.prepare("SELECT count(*) AS rows FROM logs WHERE target = 'log'").get()).toEqual({ rows: 0 });
+        expect(after.prepare("SELECT count(*) AS rows FROM logs WHERE feedback_log_body = 'old'").get()).toEqual({
+          rows: 0,
+        });
+        expect(after.prepare("SELECT max(length(feedback_log_body)) AS max_len FROM logs").get()).toEqual({
+          max_len: 100,
+        });
+      } finally {
+        after.close();
+      }
+    } finally {
+      if (db.isOpen) db.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -298,7 +369,6 @@ describe("TUI log cleanup", () => {
         defaultOptions({
           apply: true,
           codexHome: dir,
-          confirmPruneTuiLog: true,
           keepTuiLogMib: 1,
           pruneTuiLog: true,
         }),
@@ -340,6 +410,62 @@ describe("backup pruning", () => {
     );
   });
 
+  test("scheduled backup pruning applies without extra confirmation flags", async () => {
+    const report = await scheduleBackupPrune(defaultOptions());
+
+    expect(report.command).toContain("--apply");
+    expect(report.command).not.toContain("--confirm-");
+  });
+
+  test("clean apply schedules pruning when only the checkpoint creates a backup", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    const dbPath = path.join(dir, "state_5.sqlite");
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`
+        CREATE TABLE threads (
+          id TEXT PRIMARY KEY,
+          archived INTEGER NOT NULL DEFAULT 0,
+          archived_at INTEGER,
+          rollout_path TEXT,
+          created_at INTEGER NOT NULL DEFAULT 0,
+          updated_at INTEGER NOT NULL,
+          updated_at_ms INTEGER,
+          source TEXT,
+          agent_role TEXT,
+          cwd TEXT,
+          title TEXT,
+          preview TEXT,
+          first_user_message TEXT
+        )
+      `);
+      db.close();
+
+      const report = await cleanCodex(
+        defaultOptions({
+          afterHours: 1,
+          apply: true,
+          archiveStale: false,
+          codexHome: dir,
+          olderThanHours: 48,
+        }),
+      );
+
+      expect((report.checkpoint as Record<string, unknown>).backupPath).toEqual(expect.any(String));
+      expect(report.backupPruneSchedule).toMatchObject({
+        action: "backups-schedule-prune",
+        mode: "apply",
+        scheduled: false,
+      });
+      expect(String((report.backupPruneSchedule as Record<string, unknown>).error)).toContain(
+        "--after-hours must be greater than or equal to --older-than-hours",
+      );
+    } finally {
+      if (db.isOpen) db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("dry-runs and deletes only old codex-cleaner backup files", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
     const backupDir = path.join(dir, ".codex-cleanup-backups");
@@ -372,7 +498,6 @@ describe("backup pruning", () => {
           apply: true,
           backupDir,
           codexHome: dir,
-          confirmDeleteBackups: true,
         }),
       );
 
@@ -561,7 +686,6 @@ describe("orphan rollout archiving", () => {
           apply: true,
           archiveOrphanRollouts: true,
           codexHome: dir,
-          confirmArchiveOrphanRollouts: true,
         }),
       );
 

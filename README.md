@@ -7,7 +7,8 @@ npx codex-cleaner@latest
 ```
 
 The default TUI always dry-runs first, then offers one apply step after Codex is fully closed.
-It starts with recommended settings, or you can customize each setting.
+Its recommended path includes stale thread archiving, orphan rollout archiving, SQLite log cleanup, TUI log trimming, metadata compaction, vacuum, and WAL checkpointing.
+You can customize each setting when needed.
 
 Current cleanup:
 
@@ -16,8 +17,8 @@ Current cleanup:
 - caps huge old `threads.title`, `threads.preview`, and `threads.first_user_message` values
 - optionally caps recent unprotected metadata too
 - vacuums `state_5.sqlite`
-- optionally prunes/caps and vacuums `logs_2.sqlite`
-- optionally backs up and trims `log/codex-tui.log`
+- prunes old/noisy rows, caps giant payloads, and vacuums `logs_2.sqlite`
+- backs up and trims `log/codex-tui.log`
 - checkpoints/truncates `state_5.sqlite-wal`
 - scans, prunes, or schedules pruning for old cleaner backups
 
@@ -30,7 +31,7 @@ npx codex-cleaner@latest --allow-running-readonly clean --max-chars 1024 --keep-
 Noninteractive apply:
 
 ```powershell
-npx codex-cleaner@latest clean --max-chars 1024 --keep-recent-days 14 --archive-orphan-rollouts --compact-recent-metadata --prune-logs --prune-tui-log --apply --confirm-lossy-metadata --confirm-archive-stale --confirm-archive-orphan-rollouts --confirm-prune-logs --confirm-prune-tui-log
+npx codex-cleaner@latest clean --max-chars 1024 --keep-recent-days 14 --archive-orphan-rollouts --compact-recent-metadata --prune-logs --prune-tui-log --apply
 ```
 
 Backup cleanup:
@@ -38,14 +39,14 @@ Backup cleanup:
 ```powershell
 npx codex-cleaner@latest backups scan
 npx codex-cleaner@latest backups prune --older-than-hours 48
-npx codex-cleaner@latest backups prune --older-than-hours 48 --apply --confirm-delete-backups
-npx codex-cleaner@latest backups schedule-prune --after-hours 48 --apply --confirm-schedule-backup-prune
+npx codex-cleaner@latest backups prune --older-than-hours 48 --apply
+npx codex-cleaner@latest backups schedule-prune --after-hours 48 --apply
 ```
 
 File-only active-session cleanup:
 
 ```powershell
-npx codex-cleaner@latest archive-orphan-rollouts --allow-running-orphan-rollout-archive --keep-recent-days 14 --apply --confirm-archive-orphan-rollouts
+npx codex-cleaner@latest archive-orphan-rollouts --allow-running-orphan-rollout-archive --keep-recent-days 14 --apply
 ```
 
 Safety basics:
@@ -57,8 +58,8 @@ Safety basics:
 - rollout JSONL is retained; old DB-orphaned files may be moved out of active `sessions`
 - `archive-orphan-rollouts` reads SQLite but only moves JSONL files and removes empty dirs
 - backups are created in `~/.codex/.codex-cleanup-backups` before mutation
-- after Codex looks right, delete old backups to reclaim disk
-- backup pruning is dry-run unless `--apply --confirm-delete-backups` is passed
+- normal apply schedules old backup pruning automatically
+- backup pruning is dry-run unless `--apply` is passed
 
 ## Dev
 
@@ -79,5 +80,5 @@ Active-session file-only cleanup:
 
 ```powershell
 node .\dist\cli.js --allow-running-readonly archive-orphan-rollouts --keep-recent-days 14
-node .\dist\cli.js archive-orphan-rollouts --allow-running-orphan-rollout-archive --keep-recent-days 14 --apply --confirm-archive-orphan-rollouts
+node .\dist\cli.js archive-orphan-rollouts --allow-running-orphan-rollout-archive --keep-recent-days 14 --apply
 ```

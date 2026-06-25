@@ -14,6 +14,14 @@ const APP_SERVER_REQUEST_TIMEOUT_MS = 60_000;
 const APP_SERVER_WINDOWS_TERMINATE_DELAY_MS = 1000;
 const APP_SERVER_SHUTDOWN_TIMEOUT_MS = 3000;
 const BACKUP_FILE_SUFFIXES = [".manifest.bak", ".bak.sqlite", ".bak"] as const;
+const LOG_TARGETS_TO_PRUNE = [
+  "codex_api::endpoint::responses_websocket",
+  "codex_api::sse::responses",
+  "codex_otel.log_only",
+  "codex_otel.trace_safe",
+  "log",
+] as const;
+const LOG_TARGET_PRUNE_PLACEHOLDERS = LOG_TARGETS_TO_PRUNE.map((_, index) => `@logTarget${index}`).join(", ");
 const STATE_VACUUM_MIN_FREE_MIB = 1;
 const TUI_LOG_COPY_CHUNK_BYTES = 8 * 1024 * 1024;
 const WINDOWS_BATCH_EXTENSIONS = new Set([".bat", ".cmd"]);
@@ -534,10 +542,6 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
       protectedIds,
     });
 
-    if (options.apply && Number(before.rows) > 0 && !options.confirmLossyMetadata) {
-      throw new Error("--apply requires --confirm-lossy-metadata");
-    }
-
     if (options.apply && Number(before.rows) > 0) {
       backupPath = await backupOpenSqliteDatabase(db, stateDb, resolveBackupDir(options, codexHome));
       const where = compactWhere({
@@ -588,24 +592,7 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
 }
 
 export async function cleanCodex(options: CleanerOptions): Promise<Record<string, unknown>> {
-  if (options.apply && options.archiveStale && !options.confirmArchiveStale) {
-    throw new Error("--apply with stale archiving requires --confirm-archive-stale");
-  }
-  if (options.apply && options.archiveOrphanRollouts && !options.confirmArchiveOrphanRollouts) {
-    throw new Error("--apply with orphan rollout archiving requires --confirm-archive-orphan-rollouts");
-  }
-  if (options.apply && options.pruneLogs && !options.confirmPruneLogs) {
-    throw new Error("--apply with log cleanup requires --confirm-prune-logs");
-  }
-  if (options.apply && options.pruneTuiLog && !options.confirmPruneTuiLog) {
-    throw new Error("--apply with TUI log cleanup requires --confirm-prune-tui-log");
-  }
-
   const scan = buildScanReport({ ...options, apply: false });
-  const compactCandidateRows = Number(asRecord(scan.compactMetadataCandidates).rows ?? 0);
-  if (options.apply && compactCandidateRows > 0 && !options.confirmLossyMetadata) {
-    throw new Error("--apply requires --confirm-lossy-metadata");
-  }
 
   if (!options.apply) {
     return {
@@ -628,6 +615,14 @@ export async function cleanCodex(options: CleanerOptions): Promise<Record<string
   const logs = options.pruneLogs ? await cleanLogs(options) : null;
   const tuiLog = options.pruneTuiLog ? await cleanTuiLog(options) : null;
   const checkpoint = await checkpointWal(options, !hasStateBackup);
+  const backupPruneSchedule = await scheduleBackupPruneAfterApply(options, [
+    archive,
+    compact,
+    vacuum,
+    logs,
+    tuiLog,
+    checkpoint,
+  ]);
 
   return {
     action: "clean",
@@ -643,14 +638,29 @@ export async function cleanCodex(options: CleanerOptions): Promise<Record<string
     logs,
     tuiLog,
     checkpoint,
+    backupPruneSchedule,
   };
 }
 
-export async function archiveStaleThreads(options: CleanerOptions): Promise<Record<string, unknown>> {
-  if (options.apply && !options.confirmArchiveStale) {
-    throw new Error("--apply requires --confirm-archive-stale");
+async function scheduleBackupPruneAfterApply(
+  options: CleanerOptions,
+  reports: (Record<string, unknown> | null)[],
+): Promise<Record<string, unknown> | null> {
+  if (!reports.some((report) => typeof report?.backupPath === "string")) return null;
+  try {
+    return await scheduleBackupPrune({ ...options, apply: true });
+  } catch (error) {
+    return {
+      action: "backups-schedule-prune",
+      mode: "apply",
+      generatedAt: new Date().toISOString(),
+      scheduled: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
+}
 
+export async function archiveStaleThreads(options: CleanerOptions): Promise<Record<string, unknown>> {
   const codexHome = resolveCodexHome(options);
   const stateDb = path.join(codexHome, "state_5.sqlite");
   const globalState = loadGlobalState(codexHome);
@@ -705,10 +715,6 @@ export async function archiveStaleThreads(options: CleanerOptions): Promise<Reco
 }
 
 export function archiveOrphanRollouts(options: CleanerOptions): Record<string, unknown> {
-  if (options.apply && !options.confirmArchiveOrphanRollouts) {
-    throw new Error("--apply requires --confirm-archive-orphan-rollouts");
-  }
-
   const codexHome = resolveCodexHome(options);
   const stateDb = path.join(codexHome, "state_5.sqlite");
   const cutoffMs = recentCutoffMs(options.keepRecentDays);
@@ -860,10 +866,6 @@ export async function vacuumStateDatabase(
 }
 
 export async function cleanLogs(options: CleanerOptions): Promise<Record<string, unknown>> {
-  if (options.apply && !options.confirmPruneLogs) {
-    throw new Error("--apply requires --confirm-prune-logs");
-  }
-
   const codexHome = resolveCodexHome(options);
   const logsDb = path.join(codexHome, "logs_2.sqlite");
   if (!fs.existsSync(logsDb)) {
@@ -884,7 +886,8 @@ export async function cleanLogs(options: CleanerOptions): Promise<Record<string,
     const beforeFiles = fileTripletSizes(logsDb);
     const before = collectLogCleanupStats(db, options);
     const beforeSpace = collectSqliteSpaceStats(db);
-    const hasRowChanges = Number(before.cap_rows) > 0 || Number(before.delete_rows) > 0;
+    const hasRowChanges =
+      Number(before.cap_rows) > 0 || Number(before.delete_rows) > 0 || Number(before.target_prune_rows) > 0;
     const shouldVacuum = Number(beforeSpace.freelist_count) > 0 || hasRowChanges;
     if (options.apply && shouldVacuum) {
       backupPath = await backupOpenSqliteDatabase(db, logsDb, resolveBackupDir(options, codexHome));
@@ -892,7 +895,10 @@ export async function cleanLogs(options: CleanerOptions): Promise<Record<string,
       if (hasRowChanges) {
         runTransaction(db, () => {
           deletedRows = Number(
-            prepareStatement(db, "DELETE FROM logs WHERE ts < @cutoffSeconds").run({ cutoffSeconds }).changes,
+            prepareStatement(
+              db,
+              `DELETE FROM logs WHERE ts < @cutoffSeconds OR target IN (${LOG_TARGET_PRUNE_PLACEHOLDERS})`,
+            ).run({ cutoffSeconds, ...logTargetPruneParams() }).changes,
           );
           cappedRows = Number(
             prepareStatement(
@@ -941,10 +947,6 @@ export async function cleanLogs(options: CleanerOptions): Promise<Record<string,
 }
 
 export async function cleanTuiLog(options: CleanerOptions): Promise<Record<string, unknown>> {
-  if (options.apply && !options.confirmPruneTuiLog) {
-    throw new Error("--apply requires --confirm-prune-tui-log");
-  }
-
   const codexHome = resolveCodexHome(options);
   const logPath = path.join(codexHome, "log", "codex-tui.log");
   const before = collectTuiLogCleanupStats(logPath, options.keepTuiLogMib);
@@ -994,10 +996,6 @@ export function scanBackups(options: CleanerOptions): Record<string, unknown> {
 }
 
 export function pruneBackups(options: CleanerOptions): Record<string, unknown> {
-  if (options.apply && !options.confirmDeleteBackups) {
-    throw new Error("--apply requires --confirm-delete-backups");
-  }
-
   const before = buildBackupPrunePlan(options);
   const deleted: BackupFile[] = [];
   if (options.apply) {
@@ -1031,9 +1029,6 @@ export function pruneBackups(options: CleanerOptions): Record<string, unknown> {
 }
 
 export async function scheduleBackupPrune(options: CleanerOptions): Promise<Record<string, unknown>> {
-  if (options.apply && !options.confirmScheduleBackupPrune) {
-    throw new Error("--apply requires --confirm-schedule-backup-prune");
-  }
   if (options.afterHours < options.olderThanHours) {
     throw new Error("--after-hours must be greater than or equal to --older-than-hours");
   }
@@ -1334,6 +1329,7 @@ function collectLogStats(db: DatabaseSync): Record<string, unknown> {
 export function collectLogCleanupStats(db: DatabaseSync, options: CleanerOptions): Record<string, unknown> {
   const params = {
     cutoffSeconds: logCutoffSeconds(options.keepLogDays),
+    ...logTargetPruneParams(),
     maxLogBodyChars: options.maxLogBodyChars,
   };
   const stats = queryOne(
@@ -1345,8 +1341,15 @@ export function collectLogCleanupStats(db: DatabaseSync, options: CleanerOptions
       coalesce(round(sum(CASE WHEN ts < @cutoffSeconds THEN estimated_bytes ELSE 0 END) / 1048576.0, 2), 0)
         AS delete_estimated_payload_mib,
       coalesce(sum(
+        CASE WHEN ts >= @cutoffSeconds AND target IN (${LOG_TARGET_PRUNE_PLACEHOLDERS}) THEN 1 ELSE 0 END
+      ), 0) AS target_prune_rows,
+      coalesce(round(sum(
+        CASE WHEN ts >= @cutoffSeconds AND target IN (${LOG_TARGET_PRUNE_PLACEHOLDERS}) THEN estimated_bytes ELSE 0 END
+      ) / 1048576.0, 2), 0) AS target_prune_estimated_payload_mib,
+      coalesce(sum(
         CASE
           WHEN ts >= @cutoffSeconds
+            AND target NOT IN (${LOG_TARGET_PRUNE_PLACEHOLDERS})
             AND feedback_log_body IS NOT NULL
             AND length(feedback_log_body) > @maxLogBodyChars
           THEN 1
@@ -1356,6 +1359,7 @@ export function collectLogCleanupStats(db: DatabaseSync, options: CleanerOptions
       coalesce(round(sum(
         CASE
           WHEN ts >= @cutoffSeconds
+            AND target NOT IN (${LOG_TARGET_PRUNE_PLACEHOLDERS})
             AND feedback_log_body IS NOT NULL
             AND length(feedback_log_body) > @maxLogBodyChars
           THEN length(feedback_log_body) - @maxLogBodyChars
@@ -1375,6 +1379,7 @@ export function collectLogCleanupStats(db: DatabaseSync, options: CleanerOptions
       max: secondsToIso(asNumberOrNull(stats.max_ts)),
       min: secondsToIso(asNumberOrNull(stats.min_ts)),
     },
+    targetPruneTargets: [...LOG_TARGETS_TO_PRUNE],
   };
 }
 
@@ -1845,7 +1850,6 @@ function buildBackupPruneCommand(
       "--older-than-hours",
       String(olderThanHours),
       "--apply",
-      "--confirm-delete-backups",
     ],
     command: "npx",
   };
@@ -2235,6 +2239,10 @@ function logCutoffSeconds(days: number): number {
   return Math.floor(recentCutoffMs(days) / 1000);
 }
 
+function logTargetPruneParams(): Record<string, string> {
+  return Object.fromEntries(LOG_TARGETS_TO_PRUNE.map((target, index) => [`logTarget${index}`, target]));
+}
+
 function secondsToIso(seconds: number | null): string | null {
   return seconds == null ? null : new Date(seconds * 1000).toISOString();
 }
@@ -2360,6 +2368,7 @@ function printCleanApplySummary(report: Record<string, unknown>): void {
   const logs = asRecord(report.logs);
   const tuiLog = asRecord(report.tuiLog);
   const checkpoint = asRecord(report.checkpoint);
+  const backupPruneSchedule = asRecord(report.backupPruneSchedule);
 
   printArchiveApplySummary(archive);
   printOrphanRolloutSummary(orphanRollouts);
@@ -2369,6 +2378,7 @@ function printCleanApplySummary(report: Record<string, unknown>): void {
   printTuiLogApplySummary(tuiLog);
   if (Object.keys(checkpoint).length) printWalCheckpoint(checkpoint);
   printBackupReminder([archive, compact, vacuum, logs, tuiLog]);
+  printBackupPruneSchedule(backupPruneSchedule);
 }
 
 function printArchiveApplySummary(report: Record<string, unknown>): void {
@@ -2453,10 +2463,14 @@ function printLogsApplySummary(report: Record<string, unknown>): void {
   console.log(`  deleted rows: ${String(report.deletedRows ?? 0)}`);
   console.log(`  capped rows: ${String(report.cappedRows ?? 0)}`);
   console.log(
-    `  remaining cleanup candidates: delete=${String(after.delete_rows ?? 0)} cap=${String(after.cap_rows ?? 0)}`,
+    `  remaining cleanup candidates: delete=${String(after.delete_rows ?? 0)} noisy=${String(
+      after.target_prune_rows ?? 0,
+    )} cap=${String(after.cap_rows ?? 0)}`,
   );
   console.log(
-    `  estimated savings before apply: delete=${String(before.delete_estimated_payload_mib ?? 0)} MiB cap=${String(
+    `  estimated savings before apply: delete=${String(
+      before.delete_estimated_payload_mib ?? 0,
+    )} MiB noisy=${String(before.target_prune_estimated_payload_mib ?? 0)} MiB cap=${String(
       before.cap_estimated_savings_mib ?? 0,
     )} MiB`,
   );
@@ -2489,7 +2503,21 @@ function printBackupReminder(reports: Record<string, unknown>[]): void {
   const backupPaths = reports.map((report) => report.backupPath).filter((value) => typeof value === "string");
   if (!backupPaths.length) return;
   console.log(`\nBackups: ${path.dirname(String(backupPaths[0]))}`);
-  console.log("  Keep them until Codex looks right, then delete them to reclaim disk.");
+}
+
+function printBackupPruneSchedule(report: Record<string, unknown>): void {
+  if (!Object.keys(report).length) return;
+  console.log("\nBackup cleanup schedule:");
+  if (report.error) {
+    console.log(`  automatic scheduling failed: ${String(report.error)}`);
+    return;
+  }
+  const policy = asRecord(report.policy);
+  console.log(`  scheduled: ${String(report.scheduled)}`);
+  console.log(`  runs: ${String(policy.runAtUtc ?? report.runAtUtc ?? null)}`);
+  if (report.taskName) console.log(`  task: ${String(report.taskName)}`);
+  if (report.jobId) console.log(`  job: ${String(report.jobId)}`);
+  if (report.cancelCommand) console.log(`  cancel: ${String(report.cancelCommand)}`);
 }
 
 function printBackupsReport(report: Record<string, unknown>): void {
@@ -2616,6 +2644,8 @@ function printLogCleanupCandidate(title: string, value: unknown): void {
     "rows",
     "delete_rows",
     "delete_estimated_payload_mib",
+    "target_prune_rows",
+    "target_prune_estimated_payload_mib",
     "cap_rows",
     "cap_estimated_savings_mib",
     "cutoffUtc",

@@ -43,14 +43,6 @@ Options:
   --apply                         write changes; omitted means dry-run
   --backup-dir <path>             backup destination for mutating commands
   --codex-command <cmd>           codex executable/npm shim; arbitrary Windows batch wrappers are rejected
-  --confirm-archive-stale         required with clean --apply when archiving stale threads
-  --confirm-archive-orphan-rollouts
-                                  required with clean --apply --archive-orphan-rollouts
-  --confirm-lossy-metadata        required with compact-metadata --apply
-  --confirm-prune-logs            required with clean --apply --prune-logs
-  --confirm-prune-tui-log         required with clean --apply --prune-tui-log
-  --confirm-delete-backups        required with backups prune --apply
-  --confirm-schedule-backup-prune required with backups schedule-prune --apply
   --json                          emit JSON
   --help                          show help
 `;
@@ -73,13 +65,6 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
       "codex-command": { type: "string" },
       "codex-home": { type: "string" },
       "compact-recent-metadata": { type: "boolean", default: false },
-      "confirm-archive-stale": { type: "boolean", default: false },
-      "confirm-archive-orphan-rollouts": { type: "boolean", default: false },
-      "confirm-delete-backups": { type: "boolean", default: false },
-      "confirm-lossy-metadata": { type: "boolean", default: false },
-      "confirm-prune-logs": { type: "boolean", default: false },
-      "confirm-prune-tui-log": { type: "boolean", default: false },
-      "confirm-schedule-backup-prune": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       "include-rollouts": { type: "boolean", default: false },
       "include-logs": { type: "boolean", default: false },
@@ -119,13 +104,6 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
     codexCommand: parsed.values["codex-command"],
     codexHome: parsed.values["codex-home"],
     compactRecentMetadata: Boolean(parsed.values["compact-recent-metadata"]),
-    confirmArchiveStale: Boolean(parsed.values["confirm-archive-stale"]),
-    confirmArchiveOrphanRollouts: Boolean(parsed.values["confirm-archive-orphan-rollouts"]),
-    confirmDeleteBackups: Boolean(parsed.values["confirm-delete-backups"]),
-    confirmLossyMetadata: Boolean(parsed.values["confirm-lossy-metadata"]),
-    confirmPruneLogs: Boolean(parsed.values["confirm-prune-logs"]),
-    confirmPruneTuiLog: Boolean(parsed.values["confirm-prune-tui-log"]),
-    confirmScheduleBackupPrune: Boolean(parsed.values["confirm-schedule-backup-prune"]),
     includeLogs: Boolean(parsed.values["include-logs"]),
     includeRollouts: Boolean(parsed.values["include-rollouts"]),
     json: Boolean(parsed.values.json),
