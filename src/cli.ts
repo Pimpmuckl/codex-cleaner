@@ -8,46 +8,32 @@ const USAGE = `
 codex-cleaner [command] [options]
 
 Commands:
-  (none)            Guided TUI: choose settings, dry-run, then optionally apply
-  clean             Compact old metadata, vacuum SQLite, and run selected archive tasks
-  scan              Read-only size, protection, candidate, and optional rollout-linkage report
-  compact-metadata  Cap old threads.title/preview/first_user_message values
-  checkpoint-wal    Run PRAGMA wal_checkpoint(TRUNCATE) for state_5.sqlite
-  archive-orphan-rollouts
-                    Move old DB-unreferenced sessions JSONL into archived_sessions
-  backups scan      Inspect codex-cleaner backup files
-  backups prune     Delete codex-cleaner backup files after a dry-run
-  backups schedule-prune
-                    Schedule a one-shot future backups prune job
+  (none)                  Choose Clean up or Full cleanup, scan, then optionally apply
+  scan                    Show what cleanup would reclaim
+  clean                   Apply with --apply; otherwise dry-run
+  backups scan            Inspect codex-cleaner backup files
+  backups prune           Delete old codex-cleaner backup files with --apply
+  backups schedule-prune  Schedule a one-shot future backups prune job
 
-Options:
-  --codex-home <path>             Codex home path; defaults to CODEX_HOME or ~/.codex
-  --sqlite-home <path>            SQLite directory; overrides config.toml and CODEX_SQLITE_HOME
-  --log-dir <path>                Log directory; overrides config.toml and CODEX_HOME/log
-  --allow-running-readonly        Allow read-only dry-runs while Codex processes are active
-  --allow-running-orphan-rollout-archive
-                                  Allow archive-orphan-rollouts --apply while Codex is active
-  --archive-stale                 clean: archive stale threads through Codex's app-server API
-  --archive-orphan-rollouts       clean: move old DB-unreferenced sessions JSONL into archived_sessions
-  --compact-recent-metadata       Also cap recent unprotected metadata; pinned/open/active stay protected
-  --include-logs                  scan: include expensive logs_2.sqlite table stats
-  --include-rollouts              scan: include sessions/archived_sessions linkage scan
-  --vacuum-logs                   clean: reclaim free space; scan: include logs_2.sqlite stats
-  --prune-tui-log                 clean: back up and truncate log/codex-tui.log
-  --keep-tui-log-mib <n>          codex-tui.log tail to retain with --prune-tui-log; default 16
-  --older-than-hours <n>          backups prune age threshold; default 48
-  --after-hours <n>               backups schedule-prune delay; default 48
-  --max-chars <n>                 compact cap; default 1024
-  --keep-recent-days <n>          protect recently updated threads; default 14
-  --archived-only                 compact only archived threads
-  --apply                         write changes; omitted means dry-run
-  --backup-dir <path>             backup destination for mutating commands
-  --codex-command <cmd>           codex executable/npm shim; arbitrary Windows batch wrappers are rejected
-  --json                          emit JSON
-  --help                          show help
+Cleanup options:
+  --full                  Also permanently delete old archived threads and rollout JSONL
+  --keep-days <n>         Full cleanup retention; default 90 days (requires --full)
+  --apply                 Apply changes; omitted means dry-run
+
+Path and output options:
+  --codex-home <path>     Codex home; defaults to CODEX_HOME or ~/.codex
+  --sqlite-home <path>    SQLite directory; overrides config.toml and CODEX_SQLITE_HOME
+  --backup-dir <path>     Backup destination for database maintenance
+  --codex-command <cmd>   Codex executable used for full cleanup
+  --json                  Emit JSON
+
+Backup options:
+  --older-than-hours <n>  backups prune age threshold; default 48
+  --after-hours <n>       backups schedule-prune delay; default 48
+  --help                  Show help
 `;
 
-const COMMANDS = ["scan", "clean", "compact-metadata", "checkpoint-wal", "archive-orphan-rollouts", "backups"] as const;
+const COMMANDS = ["scan", "clean", "backups"] as const;
 const BACKUP_COMMANDS = ["scan", "prune", "schedule-prune"] as const;
 
 async function main(argv = process.argv.slice(2)): Promise<number> {
@@ -55,29 +41,17 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
     args: argv,
     allowPositionals: true,
     options: {
-      "allow-running-readonly": { type: "boolean", default: false },
-      "allow-running-orphan-rollout-archive": { type: "boolean", default: false },
       "after-hours": { type: "string", default: "48" },
       apply: { type: "boolean", default: false },
-      "archive-orphan-rollouts": { type: "boolean", default: false },
-      "archive-stale": { type: "boolean", default: false },
-      "archived-only": { type: "boolean", default: false },
       "backup-dir": { type: "string" },
       "codex-command": { type: "string" },
       "codex-home": { type: "string" },
-      "compact-recent-metadata": { type: "boolean", default: false },
+      full: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
-      "include-rollouts": { type: "boolean", default: false },
-      "include-logs": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
-      "keep-recent-days": { type: "string", default: "14" },
-      "keep-tui-log-mib": { type: "string", default: "16" },
-      "log-dir": { type: "string" },
-      "max-chars": { type: "string", default: "1024" },
+      "keep-days": { type: "string" },
       "older-than-hours": { type: "string", default: "48" },
-      "prune-tui-log": { type: "boolean", default: false },
       "sqlite-home": { type: "string" },
-      "vacuum-logs": { type: "boolean", default: false },
     },
   });
 
@@ -91,44 +65,32 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
     console.error(USAGE.trim());
     return 2;
   }
+  if (parsed.values["keep-days"] && !parsed.values.full) {
+    throw new Error("--keep-days requires --full");
+  }
 
   const options: CleanerOptions = {
-    allowRunningReadonly: Boolean(parsed.values["allow-running-readonly"]),
-    allowRunningOrphanRolloutArchive: Boolean(parsed.values["allow-running-orphan-rollout-archive"]),
     afterHours: parsePositiveInt(String(parsed.values["after-hours"]), "--after-hours"),
-    archiveOrphanRollouts: Boolean(parsed.values["archive-orphan-rollouts"]),
-    archiveStale: Boolean(parsed.values["archive-stale"]),
     apply: Boolean(parsed.values.apply),
-    archivedOnly: Boolean(parsed.values["archived-only"]),
     backupDir: parsed.values["backup-dir"],
     codexCommand: parsed.values["codex-command"],
     codexHome: parsed.values["codex-home"],
-    compactRecentMetadata: Boolean(parsed.values["compact-recent-metadata"]),
-    includeLogs: Boolean(parsed.values["include-logs"]),
-    includeRollouts: Boolean(parsed.values["include-rollouts"]),
     json: Boolean(parsed.values.json),
-    keepRecentDays: parsePositiveInt(String(parsed.values["keep-recent-days"]), "--keep-recent-days"),
-    keepTuiLogMib: parsePositiveInt(String(parsed.values["keep-tui-log-mib"]), "--keep-tui-log-mib"),
-    logDir: parsed.values["log-dir"],
-    maxChars: parsePositiveInt(String(parsed.values["max-chars"]), "--max-chars"),
+    keepDays: parsePositiveInt(String(parsed.values["keep-days"] ?? "90"), "--keep-days"),
+    mode: parsed.values.full ? "full" : "cleanup",
     olderThanHours: parsePositiveInt(String(parsed.values["older-than-hours"]), "--older-than-hours"),
-    pruneTuiLog: Boolean(parsed.values["prune-tui-log"]),
     sqliteHome: parsed.values["sqlite-home"],
-    vacuumLogs: Boolean(parsed.values["vacuum-logs"]),
   };
 
   const reexecCode = reexecWithSqliteWarningDisabled(argv);
   if (reexecCode != null) return reexecCode;
 
   const {
-    archiveOrphanRollouts,
     buildScanReport,
-    checkpointWal,
     cleanCodex,
-    compactMetadata,
     emitReport,
     pruneBackups,
-    requireStoppedOrReadonlyAllowed,
+    requireCodexStopped,
     scanBackups,
     scheduleBackupPrune,
   } = await import("./cleaner.js");
@@ -136,16 +98,6 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
   if (!command) {
     const { runWizard } = await import("./wizard.js");
     return runWizard(options);
-  }
-
-  if (command !== "backups") {
-    const mutating = isMutating(command, options);
-    if (!allowsRunningFileOnlyMutation(command, options)) {
-      await requireStoppedOrReadonlyAllowed({
-        allowRunningReadonly: options.allowRunningReadonly,
-        mutating,
-      });
-    }
   }
 
   if (command === "backups") {
@@ -157,22 +109,13 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
           ? pruneBackups(options)
           : await scheduleBackupPrune(options);
     emitReport(report, options.json);
-    return 0;
+    return report.ok === false ? 1 : 0;
   }
 
-  const report =
-    command === "scan"
-      ? buildScanReport(options)
-      : command === "clean"
-        ? await cleanCodex(options)
-        : command === "compact-metadata"
-          ? await compactMetadata(options)
-          : command === "archive-orphan-rollouts"
-            ? archiveOrphanRollouts(options)
-            : await checkpointWal(options);
-
+  if (command === "clean" && options.apply) await requireCodexStopped();
+  const report = command === "scan" ? buildScanReport(options) : await cleanCodex(options);
   emitReport(report, options.json);
-  return 0;
+  return report.ok === false ? 1 : 0;
 }
 
 function parseBackupCommand(value: string | undefined): BackupCommand {
@@ -181,14 +124,6 @@ function parseBackupCommand(value: string | undefined): BackupCommand {
     throw new Error(`Unknown backups command: ${String(value)}\n${USAGE.trim()}`);
   }
   return command;
-}
-
-function isMutating(command: CleanerCommand, options: CleanerOptions): boolean {
-  return command !== "scan" && options.apply;
-}
-
-function allowsRunningFileOnlyMutation(command: CleanerCommand, options: CleanerOptions): boolean {
-  return command === "archive-orphan-rollouts" && options.apply && options.allowRunningOrphanRolloutArchive;
 }
 
 function reexecWithSqliteWarningDisabled(argv: string[]): number | null {
@@ -203,10 +138,7 @@ function reexecWithSqliteWarningDisabled(argv: string[]): number | null {
   const result = spawnSync(
     process.execPath,
     [...process.execArgv, "--disable-warning=ExperimentalWarning", process.argv[1], ...argv],
-    {
-      stdio: "inherit",
-      windowsHide: true,
-    },
+    { stdio: "inherit", windowsHide: true },
   );
   if (result.error) throw result.error;
   return result.status ?? 1;
@@ -214,9 +146,7 @@ function reexecWithSqliteWarningDisabled(argv: string[]): number | null {
 
 function parsePositiveInt(raw: string, name: string): number {
   const value = Number(raw);
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new Error(`${name} must be a positive integer`);
-  }
+  if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
   return value;
 }
 
