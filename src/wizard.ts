@@ -45,19 +45,21 @@ export async function runWizard(options: CleanerOptions): Promise<number> {
 
   console.log(pc.dim("\nScanning..."));
   const report = buildScanReport(dryRunOptions);
-  printScanSummary(report);
+  const reclaimableMib = estimateReclaimableMib(report);
+  printScanSummary(report, reclaimableMib);
   if (!hasWork(report)) {
     console.log(pc.green("\nNothing to clean up."));
     return 0;
   }
 
   const deleteRows = numberAt(report, "deletePlan", "expectedDeletedThreads");
+  const reclaimable = formatSizeMib(reclaimableMib);
   const proceed = await confirm({
     default: false,
     message:
       mode === "full" && deleteRows > 0
-        ? `Permanently delete ${String(deleteRows)} archived threads and apply database cleanup?`
-        : "Apply this database cleanup?",
+        ? `Permanently delete ${String(deleteRows)} archived threads and reclaim about ${reclaimable}?`
+        : `Apply cleanup and reclaim about ${reclaimable}?`,
   });
   if (!proceed) {
     console.log(pc.dim(`\nNo changes made. Apply later with:\n  ${buildCleanCommand(dryRunOptions, true)}`));
@@ -80,36 +82,30 @@ function hasWork(report: Record<string, unknown>): boolean {
   );
 }
 
-function printScanSummary(report: Record<string, unknown>): void {
-  const files = recordAt(report, "files");
-  const state = recordAt(files, "state_5.sqlite");
-  const stateMain = recordAt(state, "main");
-  const stateWal = recordAt(state, "wal");
-  const maintenance = recordAt(report, "maintenance");
-  const stateSpace = recordAt(maintenance, "state");
-  const logsSpace = recordAt(maintenance, "logs");
-
-  console.log(pc.bold("\nDry-run summary"));
-  console.log(`  Mode: ${report.cleanupMode === "full" ? "Full cleanup" : "Clean up"}`);
-  console.log(`  Codex home: ${String(report.codexHome)}`);
-  console.log(`  SQLite home: ${String(report.sqliteHome)}`);
-  console.log(`  State database: ${formatMib(stateMain.mib)} plus ${formatMib(stateWal.mib)} WAL`);
-  console.log(`  State free pages: ${formatMib(stateSpace.free_mib)}`);
-  console.log(`  Logs free pages: ${formatMib(logsSpace.free_mib)}`);
-
+function printScanSummary(report: Record<string, unknown>, reclaimableMib: number): void {
   const deletePlan = recordAt(report, "deletePlan");
-  if (Object.keys(deletePlan).length) {
+  const deleteRows = Number(deletePlan.expectedDeletedThreads ?? 0);
+  console.log(pc.bold(`\nDry run — ${report.cleanupMode === "full" ? "Full cleanup" : "Clean up"}`));
+  console.log(`  Could reclaim: about ${formatSizeMib(reclaimableMib)}`);
+  if (deleteRows > 0) {
     console.log(
       pc.yellow(
-        `  Permanent history deletion: ${String(deletePlan.expectedDeletedThreads)} archived threads, about ${formatMib(deletePlan.rolloutSizeMib)} of rollout JSONL`,
+        `  Permanently deletes ${String(deleteRows)} archived threads older than ${String(deletePlan.retentionDays)} days.`,
       ),
     );
-    const blocked = Number(deletePlan.blockedByDescendantSafety ?? 0);
-    if (blocked > 0) console.log(pc.dim(`  Protected unsafe trees: ${String(blocked)}`));
-    console.log(pc.dim("  The database backup does not restore deleted rollout JSONL."));
+  } else if (report.cleanupMode === "full") {
+    console.log(pc.green("  No archived threads are old enough for deletion."));
   } else {
-    console.log(pc.green("  Thread history and rollout JSONL stay unchanged."));
+    console.log(pc.green("  Threads and rollout files stay unchanged."));
   }
+}
+
+export function estimateReclaimableMib(report: Record<string, unknown>): number {
+  const stateFree = numberAt(report, "maintenance", "state", "free_mib");
+  const logsFree = numberAt(report, "maintenance", "logs", "free_mib");
+  return (
+    (stateFree >= 1 ? stateFree : 0) + (logsFree >= 1 ? logsFree : 0) + numberAt(report, "deletePlan", "rolloutSizeMib")
+  );
 }
 
 function printApplySummary(report: Record<string, unknown>): void {
@@ -124,7 +120,7 @@ function printApplySummary(report: Record<string, unknown>): void {
   const checkpoint = recordAt(report, "checkpoint");
   const beforeWal = recordAt(checkpoint, "before", "wal");
   const afterWal = recordAt(checkpoint, "after", "wal");
-  console.log(`  State WAL: ${formatMib(beforeWal.mib)} -> ${formatMib(afterWal.mib)}`);
+  console.log(`  State WAL: ${formatSizeMib(beforeWal.mib)} -> ${formatSizeMib(afterWal.mib)}`);
   if (report.stateBackupPath) console.log(`  State backup: ${String(report.stateBackupPath)}`);
   const backupSchedule = recordAt(report, "backups");
   if (backupSchedule.error) {
@@ -139,7 +135,7 @@ function printVacuum(label: string, report: Record<string, unknown>): void {
   if (!Object.keys(report).length || report.exists === false) return;
   const before = recordAt(report, "before", "main");
   const after = recordAt(report, "after", "main");
-  console.log(`  ${label}: ${formatMib(before.mib)} -> ${formatMib(after.mib)}`);
+  console.log(`  ${label}: ${formatSizeMib(before.mib)} -> ${formatSizeMib(after.mib)}`);
 }
 
 export function buildCleanCommand(
@@ -179,6 +175,14 @@ function numberAt(source: unknown, ...keys: string[]): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-function formatMib(value: unknown): string {
-  return typeof value === "number" && Number.isFinite(value) ? `${value.toLocaleString()} MiB` : "unknown";
+export function formatSizeMib(value: unknown): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "unknown";
+  const units = ["MiB", "GiB", "TiB"];
+  let size = Math.max(0, value);
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${Number(size.toPrecision(3)).toString()} ${units[unit]}`;
 }

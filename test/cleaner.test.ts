@@ -21,7 +21,7 @@ import {
   vacuumLogsDatabase,
 } from "../src/cleaner.js";
 import type { CleanerOptions } from "../src/types.js";
-import { buildCleanCommand } from "../src/wizard.js";
+import { buildCleanCommand, estimateReclaimableMib, formatSizeMib } from "../src/wizard.js";
 
 function defaultOptions(overrides: Partial<CleanerOptions> = {}): CleanerOptions {
   return {
@@ -171,6 +171,12 @@ describe("native thread deletion", () => {
       expect(requests.at(-1)).toMatchObject({
         method: "thread/delete",
         params: { threadId: "019e5145-7588-72b1-a304-2e190e903357" },
+      });
+      const packageVersion = (JSON.parse(fs.readFileSync(path.resolve("package.json"), "utf8")) as { version: string })
+        .version;
+      expect(requests[0]).toMatchObject({
+        method: "initialize",
+        params: { clientInfo: { version: packageVersion } },
       });
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -337,6 +343,18 @@ describe("cleanup modes", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test("keeps reclaim estimates compact and excludes WAL plus space below the vacuum threshold", () => {
+    const report = {
+      deletePlan: { rolloutSizeMib: 4048.88 },
+      files: { "state_5.sqlite": { wal: { mib: 5.27 } } },
+      maintenance: { logs: { free_mib: 5896.52 }, state: { free_mib: 0.01 } },
+    };
+    const reclaimable = estimateReclaimableMib(report);
+    expect(reclaimable).toBeCloseTo(9945.4);
+    expect(formatSizeMib(reclaimable)).toBe("9.71 GiB");
+    expect(formatSizeMib(0.01)).toBe("0.01 MiB");
   });
 });
 

@@ -213,7 +213,7 @@ export async function mutateThreadsViaCodexAppServer(
   let succeeded = 0;
   try {
     await request("initialize", {
-      clientInfo: { name: "codex_cleaner", title: "Codex Cleaner", version: "0.2.0" },
+      clientInfo: { name: "codex_cleaner", title: "Codex Cleaner", version: "0.2.1" },
     });
     child.stdin.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
 
