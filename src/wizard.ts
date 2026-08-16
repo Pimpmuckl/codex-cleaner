@@ -521,6 +521,7 @@ export function buildCleanCommand(
     options.archiveOrphanRollouts ? "--archive-orphan-rollouts" : "",
     options.vacuumLogs ? "--vacuum-logs" : "",
     options.pruneTuiLog ? "--prune-tui-log" : "",
+    options.pruneTuiLog ? `--keep-tui-log-mib ${options.keepTuiLogMib}` : "",
     options.compactRecentMetadata ? "--compact-recent-metadata" : "",
     apply ? "--apply" : "",
   ].filter(Boolean);
@@ -529,7 +530,7 @@ export function buildCleanCommand(
 }
 
 function shellQuote(value: string, platform: NodeJS.Platform): string {
-  return platform === "win32" ? `'${value.replaceAll("'", "''")}'` : `'${value.replaceAll("'", `'"'"'`)}`;
+  return platform === "win32" ? `'${value.replaceAll("'", "''")}'` : `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 function recordAt(source: unknown, ...keys: string[]): Record<string, unknown> {

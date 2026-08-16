@@ -32,7 +32,7 @@ Options:
   --compact-recent-metadata       Also cap recent unprotected metadata; pinned/open/active stay protected
   --include-logs                  scan: include expensive logs_2.sqlite table stats
   --include-rollouts              scan: include sessions/archived_sessions linkage scan
-  --vacuum-logs                   clean: reclaim free space in logs_2.sqlite without changing retention
+  --vacuum-logs                   clean: reclaim free space; scan: include logs_2.sqlite stats
   --prune-tui-log                 clean: back up and truncate log/codex-tui.log
   --keep-tui-log-mib <n>          codex-tui.log tail to retain with --prune-tui-log; default 16
   --older-than-hours <n>          backups prune age threshold; default 48

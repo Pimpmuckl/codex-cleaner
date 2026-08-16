@@ -22,7 +22,9 @@ Expensive or uncommon work is opt-in:
 - `--prune-tui-log` backs up and trims an explicitly enabled `codex-tui.log`
 - `--include-rollouts` adds the slower rollout-linkage scan
 
-The cleaner follows root-level `sqlite_home` and `log_dir` values in `config.toml`, plus `CODEX_SQLITE_HOME`. Use `--sqlite-home` or `--log-dir` for an explicit override.
+SQLite paths resolve in this order: `--sqlite-home`, root-level `sqlite_home` in `config.toml`, `CODEX_SQLITE_HOME`, then `CODEX_HOME`. Log paths use `--log-dir`, root-level `log_dir`, then `CODEX_HOME/log`.
+
+When upgrading from `0.0.x`, add `--archive-stale` if you want `clean` to keep archiving stale threads. Archiving is no longer part of the default cleanup.
 
 Noninteractive dry-run and apply:
 
