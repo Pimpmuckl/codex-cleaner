@@ -203,7 +203,7 @@ describe("resolveCodexSpawnCommand", () => {
 });
 
 describe("archiveStaleThreads", () => {
-  test("passes the inspected SQLite home to Codex app-server", async () => {
+  test("overrides conflicting Codex storage for app-server mutations", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
     const sqliteHome = path.join(dir, "sqlite");
     const capturePath = path.join(dir, "app-server-env.json");
@@ -214,11 +214,12 @@ describe("archiveStaleThreads", () => {
     try {
       fs.mkdirSync(path.dirname(script), { recursive: true });
       fs.writeFileSync(shim, "");
+      fs.writeFileSync(path.join(dir, "config.toml"), "sqlite_home = 'configured-elsewhere'\n");
       fs.writeFileSync(
         script,
         `const fs = require("node:fs");
 const readline = require("node:readline");
-fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ sqliteHome: process.env.CODEX_SQLITE_HOME }));
+fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args: process.argv.slice(2), sqliteHome: process.env.CODEX_SQLITE_HOME }));
 const lines = readline.createInterface({ input: process.stdin });
 lines.on("line", (line) => {
   const message = JSON.parse(line);
@@ -251,7 +252,10 @@ lines.on("line", (line) => {
       );
 
       expect(report.requestedArchiveCalls).toBe(1);
-      expect(JSON.parse(fs.readFileSync(capturePath, "utf8"))).toEqual({ sqliteHome });
+      expect(JSON.parse(fs.readFileSync(capturePath, "utf8"))).toEqual({
+        args: ["-c", `sqlite_home=${JSON.stringify(sqliteHome)}`, "app-server", "--listen", "stdio://"],
+        sqliteHome,
+      });
     } finally {
       if (db.isOpen) db.close();
       fs.rmSync(dir, { recursive: true, force: true });

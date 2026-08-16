@@ -144,7 +144,13 @@ async function archiveThreadsViaCodexAppServer(
   codexHome: string,
   sqliteHome: string,
 ): Promise<Record<string, unknown>> {
-  const spawnCommand = await resolveCodexSpawnCommand(codexCommand, ["app-server", "--listen", "stdio://"]);
+  const spawnCommand = await resolveCodexSpawnCommand(codexCommand, [
+    "-c",
+    `sqlite_home=${JSON.stringify(sqliteHome)}`,
+    "app-server",
+    "--listen",
+    "stdio://",
+  ]);
   const child = spawn(spawnCommand.command, spawnCommand.args, {
     env: { ...process.env, CODEX_HOME: codexHome, CODEX_SQLITE_HOME: sqliteHome },
     stdio: ["pipe", "pipe", "pipe"],
