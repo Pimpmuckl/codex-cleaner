@@ -142,10 +142,11 @@ async function archiveThreadsViaCodexAppServer(
   threadIds: string[],
   codexCommand: string,
   codexHome: string,
+  sqliteHome: string,
 ): Promise<Record<string, unknown>> {
   const spawnCommand = await resolveCodexSpawnCommand(codexCommand, ["app-server", "--listen", "stdio://"]);
   const child = spawn(spawnCommand.command, spawnCommand.args, {
-    env: { ...process.env, CODEX_HOME: codexHome },
+    env: { ...process.env, CODEX_HOME: codexHome, CODEX_SQLITE_HOME: sqliteHome },
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -684,6 +685,7 @@ export async function archiveStaleThreads(options: CleanerOptions): Promise<Reco
       beforePlan.archiveCallIds,
       options.codexCommand ?? "codex",
       codexHome,
+      sqliteHome,
     );
   }
 
@@ -1851,7 +1853,10 @@ export function resolveStoragePaths(
   userHome = os.homedir(),
 ): StoragePaths {
   const codexHome = resolveUserPath(options.codexHome ?? env.CODEX_HOME ?? path.join(userHome, ".codex"), userHome);
-  const configured = readStorageConfig(codexHome);
+  const configured = readStorageConfig(codexHome, {
+    logDir: !options.logDir,
+    sqliteHome: !options.sqliteHome,
+  });
   const sqliteHome = options.sqliteHome
     ? resolveUserPath(options.sqliteHome, userHome)
     : configured.sqliteHome
@@ -1867,7 +1872,11 @@ export function resolveStoragePaths(
   return { codexHome, logDir, sqliteHome };
 }
 
-function readStorageConfig(codexHome: string): { logDir?: string; sqliteHome?: string } {
+function readStorageConfig(
+  codexHome: string,
+  requested: { logDir: boolean; sqliteHome: boolean },
+): { logDir?: string; sqliteHome?: string } {
+  if (!requested.logDir && !requested.sqliteHome) return {};
   const configPath = path.join(codexHome, "config.toml");
   if (!fs.existsSync(configPath)) return {};
 
@@ -1876,6 +1885,7 @@ function readStorageConfig(codexHome: string): { logDir?: string; sqliteHome?: s
     if (/^\s*\[/.test(line)) break;
     const key = line.match(/^\s*(sqlite_home|log_dir)\s*=/)?.[1];
     if (!key) continue;
+    if ((key === "sqlite_home" && !requested.sqliteHome) || (key === "log_dir" && !requested.logDir)) continue;
     const value = line.match(/^\s*(?:sqlite_home|log_dir)\s*=\s*("(?:\\.|[^"\\])*"|'[^']*')\s*(?:#.*)?$/)?.[1];
     if (!value) {
       throw new Error(`Unsupported ${key} syntax in ${configPath}; use --${key.replace("_", "-")} to override it`);

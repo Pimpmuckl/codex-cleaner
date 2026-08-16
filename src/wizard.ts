@@ -2,7 +2,13 @@ import { confirm, input, select } from "@inquirer/prompts";
 import path from "node:path";
 import pc from "picocolors";
 
-import { buildScanReport, cleanCodex, findBlockingProcesses, requireStoppedOrReadonlyAllowed } from "./cleaner.js";
+import {
+  buildScanReport,
+  cleanCodex,
+  findBlockingProcesses,
+  requireStoppedOrReadonlyAllowed,
+  resolveStoragePaths,
+} from "./cleaner.js";
 import type { CleanerOptions } from "./types.js";
 
 type Choice<T> = {
@@ -492,25 +498,38 @@ function printBackupPruneSchedule(report: Record<string, unknown> | null): void 
 }
 
 function printDryRunCommand(options: CleanerOptions): void {
-  const archiveFlag = options.archiveStale ? " --archive-stale" : "";
-  const orphanFlag = options.archiveOrphanRollouts ? " --archive-orphan-rollouts" : "";
-  const logsFlag = options.vacuumLogs ? " --vacuum-logs" : "";
-  const tuiLogFlag = options.pruneTuiLog ? " --prune-tui-log" : "";
-  const recentFlag = options.compactRecentMetadata ? " --compact-recent-metadata" : "";
-  console.log(
-    `  npx codex-cleaner@latest --allow-running-readonly clean --max-chars ${options.maxChars} --keep-recent-days ${options.keepRecentDays}${archiveFlag}${orphanFlag}${logsFlag}${tuiLogFlag}${recentFlag}`,
-  );
+  console.log(`  ${buildCleanCommand(options, false)}`);
 }
 
 function printApplyCommand(options: CleanerOptions): void {
-  const archiveFlags = options.archiveStale ? " --archive-stale" : "";
-  const orphanFlags = options.archiveOrphanRollouts ? " --archive-orphan-rollouts" : "";
-  const logsFlags = options.vacuumLogs ? " --vacuum-logs" : "";
-  const tuiLogFlags = options.pruneTuiLog ? " --prune-tui-log" : "";
-  const recentFlag = options.compactRecentMetadata ? " --compact-recent-metadata" : "";
-  console.log(
-    `  npx codex-cleaner@latest clean --max-chars ${options.maxChars} --keep-recent-days ${options.keepRecentDays} --apply${archiveFlags}${orphanFlags}${logsFlags}${tuiLogFlags}${recentFlag}`,
-  );
+  console.log(`  ${buildCleanCommand(options, true)}`);
+}
+
+export function buildCleanCommand(
+  options: CleanerOptions,
+  apply: boolean,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const storage = resolveStoragePaths(options);
+  const flags = [
+    `--codex-home ${shellQuote(storage.codexHome, platform)}`,
+    `--sqlite-home ${shellQuote(storage.sqliteHome, platform)}`,
+    `--log-dir ${shellQuote(storage.logDir, platform)}`,
+    `--max-chars ${options.maxChars}`,
+    `--keep-recent-days ${options.keepRecentDays}`,
+    options.archiveStale ? "--archive-stale" : "",
+    options.archiveOrphanRollouts ? "--archive-orphan-rollouts" : "",
+    options.vacuumLogs ? "--vacuum-logs" : "",
+    options.pruneTuiLog ? "--prune-tui-log" : "",
+    options.compactRecentMetadata ? "--compact-recent-metadata" : "",
+    apply ? "--apply" : "",
+  ].filter(Boolean);
+  const prefix = apply ? "npx codex-cleaner@latest clean" : "npx codex-cleaner@latest --allow-running-readonly clean";
+  return `${prefix} ${flags.join(" ")}`;
+}
+
+function shellQuote(value: string, platform: NodeJS.Platform): string {
+  return platform === "win32" ? `'${value.replaceAll("'", "''")}'` : `'${value.replaceAll("'", `'"'"'`)}`;
 }
 
 function recordAt(source: unknown, ...keys: string[]): Record<string, unknown> {

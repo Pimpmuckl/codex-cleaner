@@ -10,6 +10,7 @@ import {
   collectTuiLogCleanupStats,
   collectStaleArchiveCandidateStats,
   archiveOrphanRollouts,
+  archiveStaleThreads,
   checkpointWal,
   cleanCodex,
   cleanTuiLog,
@@ -26,7 +27,7 @@ import {
   vacuumLogsDatabase,
 } from "../src/cleaner.js";
 import type { CleanerOptions } from "../src/types.js";
-import { recommendedWizardOptions } from "../src/wizard.js";
+import { buildCleanCommand, recommendedWizardOptions } from "../src/wizard.js";
 
 function defaultOptions(overrides: Partial<CleanerOptions> = {}): CleanerOptions {
   return {
@@ -201,6 +202,63 @@ describe("resolveCodexSpawnCommand", () => {
   });
 });
 
+describe("archiveStaleThreads", () => {
+  test("passes the inspected SQLite home to Codex app-server", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    const sqliteHome = path.join(dir, "sqlite");
+    const capturePath = path.join(dir, "app-server-env.json");
+    const shim = path.join(dir, "codex.cmd");
+    const script = path.join(dir, "node_modules", "@openai", "codex", "bin", "codex.js");
+    fs.mkdirSync(sqliteHome, { recursive: true });
+    const db = new DatabaseSync(path.join(sqliteHome, "state_5.sqlite"));
+    try {
+      fs.mkdirSync(path.dirname(script), { recursive: true });
+      fs.writeFileSync(shim, "");
+      fs.writeFileSync(
+        script,
+        `const fs = require("node:fs");
+const readline = require("node:readline");
+fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ sqliteHome: process.env.CODEX_SQLITE_HOME }));
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.id) process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+});
+`,
+      );
+      db.exec(`
+        CREATE TABLE threads (
+          id TEXT PRIMARY KEY,
+          archived INTEGER NOT NULL DEFAULT 0,
+          archived_at INTEGER,
+          rollout_path TEXT NOT NULL,
+          updated_at INTEGER NOT NULL,
+          updated_at_ms INTEGER,
+          cwd TEXT NOT NULL,
+          title TEXT NOT NULL
+        );
+        CREATE TABLE thread_spawn_edges (
+          parent_thread_id TEXT NOT NULL,
+          child_thread_id TEXT NOT NULL PRIMARY KEY,
+          status TEXT NOT NULL
+        );
+        INSERT INTO threads VALUES ('old-thread', 0, NULL, '', 1, 1, 'cwd', 'old');
+      `);
+      db.close();
+
+      const report = await archiveStaleThreads(
+        defaultOptions({ apply: true, codexCommand: shim, codexHome: dir, sqliteHome }),
+      );
+
+      expect(report.requestedArchiveCalls).toBe(1);
+      expect(JSON.parse(fs.readFileSync(capturePath, "utf8"))).toEqual({ sqliteHome });
+    } finally {
+      if (db.isOpen) db.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("nextBackupPath", () => {
   test("does not reuse an existing backup name in the same millisecond", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
@@ -263,6 +321,36 @@ describe("storage paths", () => {
         logDir: path.join(dir, "cli-logs"),
         sqliteHome: path.join(dir, "cli-state"),
       });
+
+      fs.writeFileSync(
+        path.join(dir, "config.toml"),
+        "sqlite_home = { unsupported = 'value' }\nlog_dir = 'config-logs'\n",
+      );
+      expect(resolveStoragePaths(defaultOptions({ codexHome: dir, sqliteHome: path.join(dir, "cli-state") }))).toEqual({
+        codexHome: dir,
+        logDir: path.join(dir, "config-logs"),
+        sqliteHome: path.join(dir, "cli-state"),
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps absolute storage targets in deferred PowerShell commands", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    try {
+      const sqliteHome = path.join(dir, "state's");
+      const command = buildCleanCommand(
+        defaultOptions({ codexHome: dir, logDir: path.join(dir, "logs"), sqliteHome, vacuumLogs: true }),
+        true,
+        "win32",
+      );
+
+      expect(command).toContain(`--codex-home '${dir}'`);
+      expect(command).toContain(`--sqlite-home '${sqliteHome.replaceAll("'", "''")}'`);
+      expect(command).toContain(`--log-dir '${path.join(dir, "logs")}'`);
+      expect(command).toContain("--vacuum-logs");
+      expect(command).toMatch(/ --apply$/);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
