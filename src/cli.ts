@@ -9,7 +9,7 @@ codex-cleaner [command] [options]
 
 Commands:
   (none)            Guided TUI: choose settings, dry-run, then optionally apply
-  clean             Unified dry-run/apply for metadata compaction and stale thread archiving
+  clean             Compact old metadata, vacuum SQLite, and run selected archive tasks
   scan              Read-only size, protection, candidate, and optional rollout-linkage report
   compact-metadata  Cap old threads.title/preview/first_user_message values
   checkpoint-wal    Run PRAGMA wal_checkpoint(TRUNCATE) for state_5.sqlite
@@ -22,21 +22,21 @@ Commands:
 
 Options:
   --codex-home <path>             Codex home path; defaults to CODEX_HOME or ~/.codex
+  --sqlite-home <path>            SQLite directory; overrides config.toml and CODEX_SQLITE_HOME
+  --log-dir <path>                Log directory; overrides config.toml and CODEX_HOME/log
   --allow-running-readonly        Allow read-only dry-runs while Codex processes are active
   --allow-running-orphan-rollout-archive
                                   Allow archive-orphan-rollouts --apply while Codex is active
-  --skip-archive-stale            Do not include stale thread archiving in clean/TUI flow
+  --archive-stale                 clean: archive stale threads through Codex's app-server API
   --archive-orphan-rollouts       clean: move old DB-unreferenced sessions JSONL into archived_sessions
   --compact-recent-metadata       Also cap recent unprotected metadata; pinned/open/active stay protected
   --include-logs                  scan: include expensive logs_2.sqlite table stats
   --include-rollouts              scan: include sessions/archived_sessions linkage scan
-  --prune-logs                    clean: prune/cap logs_2.sqlite and vacuum it
+  --vacuum-logs                   clean: reclaim free space in logs_2.sqlite without changing retention
   --prune-tui-log                 clean: back up and truncate log/codex-tui.log
-  --keep-log-days <n>             log rows to keep when --prune-logs is used; default 7
   --keep-tui-log-mib <n>          codex-tui.log tail to retain with --prune-tui-log; default 16
   --older-than-hours <n>          backups prune age threshold; default 48
   --after-hours <n>               backups schedule-prune delay; default 48
-  --max-log-body-chars <n>        log feedback_log_body cap; default 4096
   --max-chars <n>                 compact cap; default 1024
   --keep-recent-days <n>          protect recently updated threads; default 14
   --archived-only                 compact only archived threads
@@ -60,6 +60,7 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
       "after-hours": { type: "string", default: "48" },
       apply: { type: "boolean", default: false },
       "archive-orphan-rollouts": { type: "boolean", default: false },
+      "archive-stale": { type: "boolean", default: false },
       "archived-only": { type: "boolean", default: false },
       "backup-dir": { type: "string" },
       "codex-command": { type: "string" },
@@ -69,15 +70,14 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
       "include-rollouts": { type: "boolean", default: false },
       "include-logs": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
-      "keep-log-days": { type: "string", default: "7" },
       "keep-recent-days": { type: "string", default: "14" },
       "keep-tui-log-mib": { type: "string", default: "16" },
-      "max-log-body-chars": { type: "string", default: "4096" },
+      "log-dir": { type: "string" },
       "max-chars": { type: "string", default: "1024" },
       "older-than-hours": { type: "string", default: "48" },
-      "prune-logs": { type: "boolean", default: false },
       "prune-tui-log": { type: "boolean", default: false },
-      "skip-archive-stale": { type: "boolean", default: false },
+      "sqlite-home": { type: "string" },
+      "vacuum-logs": { type: "boolean", default: false },
     },
   });
 
@@ -97,7 +97,7 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
     allowRunningOrphanRolloutArchive: Boolean(parsed.values["allow-running-orphan-rollout-archive"]),
     afterHours: parsePositiveInt(String(parsed.values["after-hours"]), "--after-hours"),
     archiveOrphanRollouts: Boolean(parsed.values["archive-orphan-rollouts"]),
-    archiveStale: !parsed.values["skip-archive-stale"],
+    archiveStale: Boolean(parsed.values["archive-stale"]),
     apply: Boolean(parsed.values.apply),
     archivedOnly: Boolean(parsed.values["archived-only"]),
     backupDir: parsed.values["backup-dir"],
@@ -107,14 +107,14 @@ async function main(argv = process.argv.slice(2)): Promise<number> {
     includeLogs: Boolean(parsed.values["include-logs"]),
     includeRollouts: Boolean(parsed.values["include-rollouts"]),
     json: Boolean(parsed.values.json),
-    keepLogDays: parsePositiveInt(String(parsed.values["keep-log-days"]), "--keep-log-days"),
     keepRecentDays: parsePositiveInt(String(parsed.values["keep-recent-days"]), "--keep-recent-days"),
     keepTuiLogMib: parsePositiveInt(String(parsed.values["keep-tui-log-mib"]), "--keep-tui-log-mib"),
-    maxLogBodyChars: parsePositiveInt(String(parsed.values["max-log-body-chars"]), "--max-log-body-chars"),
+    logDir: parsed.values["log-dir"],
     maxChars: parsePositiveInt(String(parsed.values["max-chars"]), "--max-chars"),
     olderThanHours: parsePositiveInt(String(parsed.values["older-than-hours"]), "--older-than-hours"),
-    pruneLogs: Boolean(parsed.values["prune-logs"]),
     pruneTuiLog: Boolean(parsed.values["prune-tui-log"]),
+    sqliteHome: parsed.values["sqlite-home"],
+    vacuumLogs: Boolean(parsed.values["vacuum-logs"]),
   };
 
   const reexecCode = reexecWithSqliteWarningDisabled(argv);

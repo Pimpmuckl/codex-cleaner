@@ -2,12 +2,7 @@ import { confirm, input, select } from "@inquirer/prompts";
 import path from "node:path";
 import pc from "picocolors";
 
-import {
-  buildScanReport,
-  cleanCodex,
-  findBlockingProcesses,
-  requireStoppedOrReadonlyAllowed,
-} from "./cleaner.js";
+import { buildScanReport, cleanCodex, findBlockingProcesses, requireStoppedOrReadonlyAllowed } from "./cleaner.js";
 import type { CleanerOptions } from "./types.js";
 
 type Choice<T> = {
@@ -52,13 +47,10 @@ export async function runWizard(options: CleanerOptions): Promise<number> {
   const compactRows = numberAt(report, "compactMetadataCandidates", "rows");
   const archiveRows = numberAt(report, "staleArchiveCandidates", "archive_call_rows");
   const orphanRolloutRows = numberAt(report, "orphanRolloutArchiveCandidates", "files");
-  const logRows =
-    numberAt(report, "logCleanupCandidates", "delete_rows") +
-    numberAt(report, "logCleanupCandidates", "target_prune_rows") +
-    numberAt(report, "logCleanupCandidates", "cap_rows");
   const tuiLogMib = numberAt(report, "tuiLogCleanupCandidates", "reclaimable_mib");
-  const vacuumMib = numberAt(report, "databaseSpace", "state_5.sqlite", "free_mib");
-  if (!compactRows && !archiveRows && !orphanRolloutRows && !logRows && !tuiLogMib && vacuumMib < 1) {
+  const stateVacuumMib = numberAt(report, "databaseSpace", "state_5.sqlite", "free_mib");
+  const logsVacuumMib = numberAt(report, "databaseSpace", "logs_2.sqlite", "free_mib");
+  if (!compactRows && !archiveRows && !orphanRolloutRows && !tuiLogMib && stateVacuumMib < 1 && logsVacuumMib < 1) {
     console.log(pc.green("\nNo cleanup candidates found under this policy."));
     return 0;
   }
@@ -93,16 +85,16 @@ export function recommendedWizardOptions(options: CleanerOptions): CleanerOption
   return {
     ...options,
     allowRunningReadonly: true,
-    archiveOrphanRollouts: true,
-    archiveStale: true,
+    archiveOrphanRollouts: false,
+    archiveStale: false,
     apply: false,
     archivedOnly: false,
     compactRecentMetadata: false,
     includeLogs: false,
     includeRollouts: false,
     json: false,
-    pruneLogs: true,
-    pruneTuiLog: true,
+    pruneTuiLog: false,
+    vacuumLogs: true,
   };
 }
 
@@ -112,7 +104,7 @@ async function customWizardOptions(options: CleanerOptions): Promise<CleanerOpti
   const compactRecentMetadata = await askCompactRecentMetadata();
   const archiveStale = await askArchiveStale();
   const archiveOrphanRollouts = await askArchiveOrphanRollouts();
-  const pruneLogs = await askPruneLogs();
+  const vacuumLogs = await askVacuumLogs();
   const pruneTuiLog = await askPruneTuiLog();
   const includeRollouts = await confirm({
     default: false,
@@ -132,8 +124,8 @@ async function customWizardOptions(options: CleanerOptions): Promise<CleanerOpti
     json: false,
     keepRecentDays,
     maxChars,
-    pruneLogs,
     pruneTuiLog,
+    vacuumLogs,
   };
 }
 
@@ -169,7 +161,7 @@ async function askWizardMode(): Promise<WizardMode> {
         value: "recommended",
       },
       {
-        description: "Choose retention windows, metadata cap, log cleanup, and archive behavior.",
+        description: "Choose metadata, vacuum, log-file, and archive behavior.",
         name: "Customize settings",
         value: "custom",
       },
@@ -246,7 +238,7 @@ async function askArchiveStale(): Promise<boolean> {
     ),
   );
   return confirm({
-    default: true,
+    default: false,
     message: "Include stale thread archiving in this cleanup?",
   });
 }
@@ -259,21 +251,17 @@ async function askArchiveOrphanRollouts(): Promise<boolean> {
     ),
   );
   return confirm({
-    default: true,
+    default: false,
     message: "Move old DB-unreferenced rollout files out of sessions?",
   });
 }
 
-async function askPruneLogs(): Promise<boolean> {
-  console.log(pc.bold("\nLog cleanup"));
-  console.log(
-    pc.dim(
-      "This prunes old logs_2.sqlite rows and caps giant feedback_log_body payloads. It does not touch threads or rollout JSONL.",
-    ),
-  );
+async function askVacuumLogs(): Promise<boolean> {
+  console.log(pc.bold("\nLogs database vacuum"));
+  console.log(pc.dim("Codex owns log retention. This only reclaims free pages already present in logs_2.sqlite."));
   return confirm({
     default: true,
-    message: "Include logs_2.sqlite cleanup in this cleanup?",
+    message: "Vacuum logs_2.sqlite to reclaim free space?",
   });
 }
 
@@ -285,7 +273,7 @@ async function askPruneTuiLog(): Promise<boolean> {
     ),
   );
   return confirm({
-    default: true,
+    default: false,
     message: "Trim codex-tui.log to the newest log tail?",
   });
 }
@@ -319,6 +307,7 @@ function printDryRunSummary(report: Record<string, unknown>): void {
   const candidates = recordAt(report, "compactMetadataCandidates");
 
   console.log(`  Codex home: ${String(report.codexHome)}`);
+  console.log(`  SQLite home: ${String(report.sqliteHome)}`);
   console.log(`  Recent window: ${String(policy.keepRecentDays)} days`);
   console.log(`  Metadata cap: ${String(policy.maxChars)} chars`);
   console.log(`  Compact recent metadata: ${policy.compactRecentMetadata ? "yes" : "no"}`);
@@ -387,17 +376,9 @@ function printDryRunSummary(report: Record<string, unknown>): void {
   if (Number(stateSpace.free_mib) >= 1) {
     console.log(pc.green(`  State vacuum: reclaim about ${formatMib(stateSpace.free_mib)} from SQLite freelist`));
   }
-  const logCleanup = recordAt(report, "logCleanupCandidates");
-  if (Object.keys(logCleanup).length) {
-    console.log(
-      pc.green(
-        `  Logs cleanup: delete ${String(logCleanup.delete_rows)} old rows, delete ${String(
-          logCleanup.target_prune_rows ?? 0,
-        )} noisy rows, and cap ${String(
-          logCleanup.cap_rows,
-        )} oversized log payloads`,
-      ),
-    );
+  const logsSpace = recordAt(report, "databaseSpace", "logs_2.sqlite");
+  if (Number(logsSpace.free_mib) >= 1) {
+    console.log(pc.green(`  Logs vacuum: reclaim about ${formatMib(logsSpace.free_mib)} from SQLite freelist`));
   }
   const tuiLogCleanup = recordAt(report, "tuiLogCleanupCandidates");
   if (Object.keys(tuiLogCleanup).length) {
@@ -471,11 +452,9 @@ function printApplySummary(
     console.log(`  State vacuum: ${formatMib(vacuumBefore.mib)} -> ${formatMib(vacuumAfter.mib)}`);
   }
   if (logsReport) {
-    console.log(
-      `  Logs cleanup: deleted ${String(logsReport.deletedRows ?? 0)} rows, capped ${String(
-        logsReport.cappedRows ?? 0,
-      )} rows`,
-    );
+    const logsBefore = recordAt(logsReport, "before", "main");
+    const logsAfter = recordAt(logsReport, "after", "main");
+    console.log(`  Logs vacuum: ${formatMib(logsBefore.mib)} -> ${formatMib(logsAfter.mib)}`);
   }
   if (tuiLogReport) {
     const tuiBefore = recordAt(tuiLogReport, "before");
@@ -513,9 +492,9 @@ function printBackupPruneSchedule(report: Record<string, unknown> | null): void 
 }
 
 function printDryRunCommand(options: CleanerOptions): void {
-  const archiveFlag = options.archiveStale ? "" : " --skip-archive-stale";
+  const archiveFlag = options.archiveStale ? " --archive-stale" : "";
   const orphanFlag = options.archiveOrphanRollouts ? " --archive-orphan-rollouts" : "";
-  const logsFlag = options.pruneLogs ? " --prune-logs" : "";
+  const logsFlag = options.vacuumLogs ? " --vacuum-logs" : "";
   const tuiLogFlag = options.pruneTuiLog ? " --prune-tui-log" : "";
   const recentFlag = options.compactRecentMetadata ? " --compact-recent-metadata" : "";
   console.log(
@@ -524,9 +503,9 @@ function printDryRunCommand(options: CleanerOptions): void {
 }
 
 function printApplyCommand(options: CleanerOptions): void {
-  const archiveFlags = options.archiveStale ? "" : " --skip-archive-stale";
+  const archiveFlags = options.archiveStale ? " --archive-stale" : "";
   const orphanFlags = options.archiveOrphanRollouts ? " --archive-orphan-rollouts" : "";
-  const logsFlags = options.pruneLogs ? " --prune-logs" : "";
+  const logsFlags = options.vacuumLogs ? " --vacuum-logs" : "";
   const tuiLogFlags = options.pruneTuiLog ? " --prune-tui-log" : "";
   const recentFlag = options.compactRecentMetadata ? " --compact-recent-metadata" : "";
   console.log(

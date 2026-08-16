@@ -14,14 +14,6 @@ const APP_SERVER_REQUEST_TIMEOUT_MS = 60_000;
 const APP_SERVER_WINDOWS_TERMINATE_DELAY_MS = 1000;
 const APP_SERVER_SHUTDOWN_TIMEOUT_MS = 3000;
 const BACKUP_FILE_SUFFIXES = [".manifest.bak", ".bak.sqlite", ".bak"] as const;
-const LOG_TARGETS_TO_PRUNE = [
-  "codex_api::endpoint::responses_websocket",
-  "codex_api::sse::responses",
-  "codex_otel.log_only",
-  "codex_otel.trace_safe",
-  "log",
-] as const;
-const LOG_TARGET_PRUNE_PLACEHOLDERS = LOG_TARGETS_TO_PRUNE.map((_, index) => `@logTarget${index}`).join(", ");
 const STATE_VACUUM_MIN_FREE_MIB = 1;
 const TUI_LOG_COPY_CHUNK_BYTES = 8 * 1024 * 1024;
 const WINDOWS_BATCH_EXTENSIONS = new Set([".bat", ".cmd"]);
@@ -29,6 +21,12 @@ const WINDOWS_BATCH_EXTENSIONS = new Set([".bat", ".cmd"]);
 type CodexSpawnCommand = {
   args: string[];
   command: string;
+};
+
+export type StoragePaths = {
+  codexHome: string;
+  logDir: string;
+  sqliteHome: string;
 };
 
 type BackupFile = {
@@ -400,25 +398,25 @@ async function stopAppServer(child: ChildProcessWithoutNullStreams): Promise<voi
 }
 
 export function buildScanReport(options: CleanerOptions): Record<string, unknown> {
-  const codexHome = resolveCodexHome(options);
-  const stateDb = path.join(codexHome, "state_5.sqlite");
-  const logsDb = path.join(codexHome, "logs_2.sqlite");
-  const goalsDb = path.join(codexHome, "goals_1.sqlite");
+  const { codexHome, logDir, sqliteHome } = resolveStoragePaths(options);
+  const stateDb = path.join(sqliteHome, "state_5.sqlite");
+  const logsDb = path.join(sqliteHome, "logs_2.sqlite");
+  const goalsDb = path.join(sqliteHome, "goals_1.sqlite");
   const globalState = loadGlobalState(codexHome);
-  const protection = loadThreadProtection(codexHome, globalState);
+  const protection = loadThreadProtection(sqliteHome, globalState);
   const protectedIds = allProtectedIds(protection);
   const cutoffMs = recentCutoffMs(options.keepRecentDays);
 
   const report: Record<string, unknown> = {
     codexHome,
+    logDir,
+    sqliteHome,
     generatedAt: new Date().toISOString(),
     policy: {
       archiveOrphanRollouts: options.archiveOrphanRollouts,
       compactRecentMetadata: options.compactRecentMetadata,
-      keepLogDays: options.keepLogDays,
       keepRecentDays: options.keepRecentDays,
       keepTuiLogMib: options.keepTuiLogMib,
-      maxLogBodyChars: options.maxLogBodyChars,
       maxChars: options.maxChars,
       recentCutoffMs: cutoffMs,
       recentCutoffUtc: millisToIso(cutoffMs),
@@ -427,7 +425,7 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
       "state_5.sqlite": fileTripletSizes(stateDb),
       "logs_2.sqlite": fileTripletSizes(logsDb),
       "goals_1.sqlite": fileTripletSizes(goalsDb),
-      "codex-tui.log": fileSize(path.join(codexHome, "log", "codex-tui.log")),
+      "codex-tui.log": fileSize(path.join(logDir, "codex-tui.log")),
     },
     protection: {
       pinnedThreads: protection.pinnedIds.size,
@@ -490,11 +488,10 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
     db.close();
   }
 
-  if ((options.includeLogs || options.pruneLogs) && fs.existsSync(logsDb)) {
+  if ((options.includeLogs || options.vacuumLogs) && fs.existsSync(logsDb)) {
     const logs = openReadonlyDb(logsDb);
     try {
       report.logs = collectLogStats(logs);
-      report.logCleanupCandidates = collectLogCleanupStats(logs, options);
       const databaseSpace = asRecord(report.databaseSpace);
       databaseSpace["logs_2.sqlite"] = collectSqliteSpaceStats(logs);
       report.databaseSpace = databaseSpace;
@@ -505,7 +502,7 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
 
   if (options.pruneTuiLog) {
     report.tuiLogCleanupCandidates = collectTuiLogCleanupStats(
-      path.join(codexHome, "log", "codex-tui.log"),
+      path.join(logDir, "codex-tui.log"),
       options.keepTuiLogMib,
     );
   }
@@ -523,10 +520,10 @@ export function buildScanReport(options: CleanerOptions): Record<string, unknown
 }
 
 export async function compactMetadata(options: CleanerOptions): Promise<Record<string, unknown>> {
-  const codexHome = resolveCodexHome(options);
-  const stateDb = path.join(codexHome, "state_5.sqlite");
+  const { codexHome, sqliteHome } = resolveStoragePaths(options);
+  const stateDb = path.join(sqliteHome, "state_5.sqlite");
   const globalState = loadGlobalState(codexHome);
-  const protection = loadThreadProtection(codexHome, globalState);
+  const protection = loadThreadProtection(sqliteHome, globalState);
   const protectedIds = allProtectedIds(protection);
   const cutoffMs = recentCutoffMs(options.keepRecentDays);
 
@@ -571,6 +568,7 @@ export async function compactMetadata(options: CleanerOptions): Promise<Record<s
       action: "compact-metadata",
       mode: options.apply ? "apply" : "dry-run",
       codexHome,
+      sqliteHome,
       generatedAt: new Date().toISOString(),
       policy: {
         archivedOnly: options.archivedOnly,
@@ -612,7 +610,7 @@ export async function cleanCodex(options: CleanerOptions): Promise<Record<string
     Number(asRecord(compact).changedRows ?? 0) > 0 ||
     Number(stateSpace.free_mib ?? 0) >= STATE_VACUUM_MIN_FREE_MIB;
   const vacuum = shouldVacuumState ? await vacuumStateDatabase(options, !hasStateBackup) : null;
-  const logs = options.pruneLogs ? await cleanLogs(options) : null;
+  const logs = options.vacuumLogs ? await vacuumLogsDatabase(options) : null;
   const tuiLog = options.pruneTuiLog ? await cleanTuiLog(options) : null;
   const checkpoint = await checkpointWal(options, !hasStateBackup);
   const backupPruneSchedule = await scheduleBackupPruneAfterApply(options, [
@@ -628,6 +626,8 @@ export async function cleanCodex(options: CleanerOptions): Promise<Record<string
     action: "clean",
     mode: "apply",
     codexHome: scan.codexHome,
+    logDir: scan.logDir,
+    sqliteHome: scan.sqliteHome,
     generatedAt: new Date().toISOString(),
     policy: scan.policy,
     scan,
@@ -661,10 +661,10 @@ async function scheduleBackupPruneAfterApply(
 }
 
 export async function archiveStaleThreads(options: CleanerOptions): Promise<Record<string, unknown>> {
-  const codexHome = resolveCodexHome(options);
-  const stateDb = path.join(codexHome, "state_5.sqlite");
+  const { codexHome, sqliteHome } = resolveStoragePaths(options);
+  const stateDb = path.join(sqliteHome, "state_5.sqlite");
   const globalState = loadGlobalState(codexHome);
-  const protection = loadThreadProtection(codexHome, globalState);
+  const protection = loadThreadProtection(sqliteHome, globalState);
   const protectedIds = allProtectedIds(protection);
   const cutoffMs = recentCutoffMs(options.keepRecentDays);
 
@@ -699,6 +699,7 @@ export async function archiveStaleThreads(options: CleanerOptions): Promise<Reco
     action: "archive-stale",
     mode: options.apply ? "apply" : "dry-run",
     codexHome,
+    sqliteHome,
     generatedAt: new Date().toISOString(),
     policy: {
       keepRecentDays: options.keepRecentDays,
@@ -715,10 +716,10 @@ export async function archiveStaleThreads(options: CleanerOptions): Promise<Reco
 }
 
 export function archiveOrphanRollouts(options: CleanerOptions): Record<string, unknown> {
-  const codexHome = resolveCodexHome(options);
-  const stateDb = path.join(codexHome, "state_5.sqlite");
+  const { codexHome, sqliteHome } = resolveStoragePaths(options);
+  const stateDb = path.join(sqliteHome, "state_5.sqlite");
   const cutoffMs = recentCutoffMs(options.keepRecentDays);
-  const protectedIds = allProtectedIds(loadThreadProtection(codexHome, loadGlobalState(codexHome)));
+  const protectedIds = allProtectedIds(loadThreadProtection(sqliteHome, loadGlobalState(codexHome)));
   const beforeDb = openReadonlyDb(stateDb);
   let beforePlan: OrphanRolloutPlan;
   try {
@@ -797,6 +798,7 @@ export function archiveOrphanRollouts(options: CleanerOptions): Record<string, u
     action: "archive-orphan-rollouts",
     mode: options.apply ? "apply" : "dry-run",
     codexHome,
+    sqliteHome,
     generatedAt: new Date().toISOString(),
     policy: {
       keepRecentDays: options.keepRecentDays,
@@ -819,8 +821,8 @@ export async function checkpointWal(
   options: CleanerOptions,
   backupBeforeCheckpoint = true,
 ): Promise<Record<string, unknown>> {
-  const codexHome = resolveCodexHome(options);
-  const stateDb = path.join(codexHome, "state_5.sqlite");
+  const { codexHome, sqliteHome } = resolveStoragePaths(options);
+  const stateDb = path.join(sqliteHome, "state_5.sqlite");
   const before = fileTripletSizes(stateDb);
   let checkpointResult: unknown = null;
   let backupPath: string | null = null;
@@ -841,6 +843,7 @@ export async function checkpointWal(
     action: "checkpoint-wal",
     mode: options.apply ? "apply" : "dry-run",
     codexHome,
+    sqliteHome,
     generatedAt: new Date().toISOString(),
     before,
     after: fileTripletSizes(stateDb),
@@ -853,102 +856,46 @@ export async function vacuumStateDatabase(
   options: CleanerOptions,
   backupBeforeVacuum = true,
 ): Promise<Record<string, unknown>> {
-  const codexHome = resolveCodexHome(options);
-  const stateDb = path.join(codexHome, "state_5.sqlite");
+  const { codexHome, sqliteHome } = resolveStoragePaths(options);
+  const stateDb = path.join(sqliteHome, "state_5.sqlite");
   return vacuumSqliteDatabase({
     action: "vacuum-state",
     apply: options.apply,
     backupBeforeVacuum,
     backupDir: resolveBackupDir(options, codexHome),
     codexHome,
+    sqliteHome,
     dbPath: stateDb,
   });
 }
 
-export async function cleanLogs(options: CleanerOptions): Promise<Record<string, unknown>> {
-  const codexHome = resolveCodexHome(options);
-  const logsDb = path.join(codexHome, "logs_2.sqlite");
+export async function vacuumLogsDatabase(options: CleanerOptions): Promise<Record<string, unknown>> {
+  const { codexHome, sqliteHome } = resolveStoragePaths(options);
+  const logsDb = path.join(sqliteHome, "logs_2.sqlite");
   if (!fs.existsSync(logsDb)) {
     return {
-      action: "clean-logs",
+      action: "vacuum-logs",
       mode: options.apply ? "apply" : "dry-run",
       codexHome,
+      sqliteHome,
       generatedAt: new Date().toISOString(),
       exists: false,
     };
   }
-
-  const db = openWritableDb(logsDb);
-  let backupPath: string | null = null;
-  let cappedRows = 0;
-  let deletedRows = 0;
-  try {
-    const beforeFiles = fileTripletSizes(logsDb);
-    const before = collectLogCleanupStats(db, options);
-    const beforeSpace = collectSqliteSpaceStats(db);
-    const hasRowChanges =
-      Number(before.cap_rows) > 0 || Number(before.delete_rows) > 0 || Number(before.target_prune_rows) > 0;
-    const shouldVacuum = Number(beforeSpace.freelist_count) > 0 || hasRowChanges;
-    if (options.apply && shouldVacuum) {
-      backupPath = await backupOpenSqliteDatabase(db, logsDb, resolveBackupDir(options, codexHome));
-      const cutoffSeconds = logCutoffSeconds(options.keepLogDays);
-      if (hasRowChanges) {
-        runTransaction(db, () => {
-          deletedRows = Number(
-            prepareStatement(
-              db,
-              `DELETE FROM logs WHERE ts < @cutoffSeconds OR target IN (${LOG_TARGET_PRUNE_PLACEHOLDERS})`,
-            ).run({ cutoffSeconds, ...logTargetPruneParams() }).changes,
-          );
-          cappedRows = Number(
-            prepareStatement(
-              db,
-              `
-                UPDATE logs
-                SET estimated_bytes = max(0, estimated_bytes - (length(feedback_log_body) - @maxLogBodyChars)),
-                    feedback_log_body = substr(feedback_log_body, 1, @maxLogBodyChars)
-                WHERE ts >= @cutoffSeconds
-                  AND feedback_log_body IS NOT NULL
-                  AND length(feedback_log_body) > @maxLogBodyChars
-              `,
-            ).run({ cutoffSeconds, maxLogBodyChars: options.maxLogBodyChars }).changes,
-          );
-        });
-      }
-      db.exec("VACUUM");
-      queryAll(db, "PRAGMA wal_checkpoint(TRUNCATE)");
-    }
-    const after = collectLogCleanupStats(db, options);
-    const afterSpace = collectSqliteSpaceStats(db);
-    return {
-      action: "clean-logs",
-      mode: options.apply ? "apply" : "dry-run",
-      codexHome,
-      generatedAt: new Date().toISOString(),
-      policy: {
-        keepLogDays: options.keepLogDays,
-        maxLogBodyChars: options.maxLogBodyChars,
-        cutoffSeconds: logCutoffSeconds(options.keepLogDays),
-        cutoffUtc: secondsToIso(logCutoffSeconds(options.keepLogDays)),
-      },
-      beforeFiles,
-      afterFiles: fileTripletSizes(logsDb),
-      before,
-      after,
-      beforeSpace,
-      afterSpace,
-      cappedRows,
-      deletedRows,
-      backupPath,
-    };
-  } finally {
-    db.close();
-  }
+  return vacuumSqliteDatabase({
+    action: "vacuum-logs",
+    apply: options.apply,
+    backupBeforeVacuum: true,
+    backupDir: resolveBackupDir(options, codexHome),
+    codexHome,
+    sqliteHome,
+    dbPath: logsDb,
+  });
 }
 
 export async function cleanTuiLog(options: CleanerOptions): Promise<Record<string, unknown>> {
-  const codexHome = resolveCodexHome(options);
-  const logPath = path.join(codexHome, "log", "codex-tui.log");
+  const { codexHome, logDir } = resolveStoragePaths(options);
+  const logPath = path.join(logDir, "codex-tui.log");
   const before = collectTuiLogCleanupStats(logPath, options.keepTuiLogMib);
   let backupPath: string | null = null;
   let truncatedBytes = 0;
@@ -963,6 +910,7 @@ export async function cleanTuiLog(options: CleanerOptions): Promise<Record<strin
     action: "clean-tui-log",
     mode: options.apply ? "apply" : "dry-run",
     codexHome,
+    logDir,
     generatedAt: new Date().toISOString(),
     policy: {
       keepTuiLogMib: options.keepTuiLogMib,
@@ -1033,7 +981,7 @@ export async function scheduleBackupPrune(options: CleanerOptions): Promise<Reco
     throw new Error("--after-hours must be greater than or equal to --older-than-hours");
   }
 
-  const codexHome = resolveCodexHome(options);
+  const { codexHome } = resolveStoragePaths(options);
   const backupDir = resolveBackupDir(options, codexHome);
   const runAt = new Date(Date.now() + options.afterHours * 60 * 60 * 1000);
   const scheduled = await schedulePruneCommand({
@@ -1326,63 +1274,6 @@ function collectLogStats(db: DatabaseSync): Record<string, unknown> {
   };
 }
 
-export function collectLogCleanupStats(db: DatabaseSync, options: CleanerOptions): Record<string, unknown> {
-  const params = {
-    cutoffSeconds: logCutoffSeconds(options.keepLogDays),
-    ...logTargetPruneParams(),
-    maxLogBodyChars: options.maxLogBodyChars,
-  };
-  const stats = queryOne(
-    db,
-    `
-    SELECT
-      count(*) AS rows,
-      coalesce(sum(CASE WHEN ts < @cutoffSeconds THEN 1 ELSE 0 END), 0) AS delete_rows,
-      coalesce(round(sum(CASE WHEN ts < @cutoffSeconds THEN estimated_bytes ELSE 0 END) / 1048576.0, 2), 0)
-        AS delete_estimated_payload_mib,
-      coalesce(sum(
-        CASE WHEN ts >= @cutoffSeconds AND target IN (${LOG_TARGET_PRUNE_PLACEHOLDERS}) THEN 1 ELSE 0 END
-      ), 0) AS target_prune_rows,
-      coalesce(round(sum(
-        CASE WHEN ts >= @cutoffSeconds AND target IN (${LOG_TARGET_PRUNE_PLACEHOLDERS}) THEN estimated_bytes ELSE 0 END
-      ) / 1048576.0, 2), 0) AS target_prune_estimated_payload_mib,
-      coalesce(sum(
-        CASE
-          WHEN ts >= @cutoffSeconds
-            AND target NOT IN (${LOG_TARGET_PRUNE_PLACEHOLDERS})
-            AND feedback_log_body IS NOT NULL
-            AND length(feedback_log_body) > @maxLogBodyChars
-          THEN 1
-          ELSE 0
-        END
-      ), 0) AS cap_rows,
-      coalesce(round(sum(
-        CASE
-          WHEN ts >= @cutoffSeconds
-            AND target NOT IN (${LOG_TARGET_PRUNE_PLACEHOLDERS})
-            AND feedback_log_body IS NOT NULL
-            AND length(feedback_log_body) > @maxLogBodyChars
-          THEN length(feedback_log_body) - @maxLogBodyChars
-          ELSE 0
-        END
-      ) / 1048576.0, 2), 0) AS cap_estimated_savings_mib,
-      min(ts) AS min_ts,
-      max(ts) AS max_ts
-    FROM logs
-  `,
-    params,
-  );
-  return {
-    ...stats,
-    cutoffUtc: secondsToIso(params.cutoffSeconds),
-    rangeUtc: {
-      max: secondsToIso(asNumberOrNull(stats.max_ts)),
-      min: secondsToIso(asNumberOrNull(stats.min_ts)),
-    },
-    targetPruneTargets: [...LOG_TARGETS_TO_PRUNE],
-  };
-}
-
 export function collectTuiLogCleanupStats(logPath: string, keepMib: number): Record<string, unknown> {
   const size = fileSize(logPath);
   const currentBytes = Number(size.bytes ?? 0);
@@ -1537,10 +1428,10 @@ function collectRolloutLinkage(db: DatabaseSync, codexHome: string): Record<stri
   };
 }
 
-function loadThreadProtection(codexHome: string, globalState: Record<string, unknown>): ThreadProtection {
+function loadThreadProtection(sqliteHome: string, globalState: Record<string, unknown>): ThreadProtection {
   const atom = asRecord(globalState["electron-persisted-atom-state"]);
   return {
-    activeGoalIds: loadActiveGoalThreadIds(path.join(codexHome, "goals_1.sqlite")),
+    activeGoalIds: loadActiveGoalThreadIds(path.join(sqliteHome, "goals_1.sqlite")),
     heartbeatIds: new Set(Object.keys(asRecord(atom["heartbeat-thread-permissions-by-id"]))),
     pinnedIds: new Set(asStringArray(globalState["pinned-thread-ids"])),
   };
@@ -1608,7 +1499,7 @@ function listBackupFiles(backupDir: string): BackupFile[] {
 }
 
 function buildBackupPrunePlan(options: CleanerOptions): BackupPrunePlan {
-  const codexHome = resolveCodexHome(options);
+  const { codexHome } = resolveStoragePaths(options);
   const backupDir = resolveBackupDir(options, codexHome);
   const cutoffMs = Date.now() - options.olderThanHours * 60 * 60 * 1000;
   const files = listBackupFiles(backupDir);
@@ -1663,6 +1554,7 @@ async function vacuumSqliteDatabase(args: {
   backupDir: string;
   codexHome: string;
   dbPath: string;
+  sqliteHome: string;
 }): Promise<Record<string, unknown>> {
   const before = fileTripletSizes(args.dbPath);
   const db = openWritableDb(args.dbPath);
@@ -1680,6 +1572,7 @@ async function vacuumSqliteDatabase(args: {
       action: args.action,
       mode: args.apply ? "apply" : "dry-run",
       codexHome: args.codexHome,
+      sqliteHome: args.sqliteHome,
       generatedAt: new Date().toISOString(),
       before,
       after: fileTripletSizes(args.dbPath),
@@ -1952,8 +1845,59 @@ function tryQueryAll(db: DatabaseSync, sql: string): Record<string, unknown>[] |
   }
 }
 
-function resolveCodexHome(options: CleanerOptions): string {
-  return path.resolve(options.codexHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex"));
+export function resolveStoragePaths(
+  options: CleanerOptions,
+  env: NodeJS.ProcessEnv = process.env,
+  userHome = os.homedir(),
+): StoragePaths {
+  const codexHome = resolveUserPath(options.codexHome ?? env.CODEX_HOME ?? path.join(userHome, ".codex"), userHome);
+  const configured = readStorageConfig(codexHome);
+  const sqliteHome = options.sqliteHome
+    ? resolveUserPath(options.sqliteHome, userHome)
+    : configured.sqliteHome
+      ? resolveConfigPath(configured.sqliteHome, codexHome, userHome)
+      : env.CODEX_SQLITE_HOME
+        ? resolveUserPath(env.CODEX_SQLITE_HOME, userHome)
+        : codexHome;
+  const logDir = options.logDir
+    ? resolveUserPath(options.logDir, userHome)
+    : configured.logDir
+      ? resolveConfigPath(configured.logDir, codexHome, userHome)
+      : path.join(codexHome, "log");
+  return { codexHome, logDir, sqliteHome };
+}
+
+function readStorageConfig(codexHome: string): { logDir?: string; sqliteHome?: string } {
+  const configPath = path.join(codexHome, "config.toml");
+  if (!fs.existsSync(configPath)) return {};
+
+  const result: { logDir?: string; sqliteHome?: string } = {};
+  for (const line of fs.readFileSync(configPath, "utf8").split(/\r?\n/)) {
+    if (/^\s*\[/.test(line)) break;
+    const key = line.match(/^\s*(sqlite_home|log_dir)\s*=/)?.[1];
+    if (!key) continue;
+    const value = line.match(/^\s*(?:sqlite_home|log_dir)\s*=\s*("(?:\\.|[^"\\])*"|'[^']*')\s*(?:#.*)?$/)?.[1];
+    if (!value) {
+      throw new Error(`Unsupported ${key} syntax in ${configPath}; use --${key.replace("_", "-")} to override it`);
+    }
+    const parsed = value.startsWith("'") ? value.slice(1, -1) : (JSON.parse(value) as string);
+    if (key === "sqlite_home") result.sqliteHome = parsed;
+    else result.logDir = parsed;
+  }
+  return result;
+}
+
+function resolveConfigPath(value: string, codexHome: string, userHome: string): string {
+  return path.resolve(codexHome, expandTilde(value, userHome));
+}
+
+function resolveUserPath(value: string, userHome: string): string {
+  return path.resolve(expandTilde(value, userHome));
+}
+
+function expandTilde(value: string, userHome: string): string {
+  if (value === "~") return userHome;
+  return /^~[\\/]/.test(value) ? path.join(userHome, value.slice(2)) : value;
 }
 
 function allProtectedIds(protection: ThreadProtection): Set<string> {
@@ -2235,14 +2179,6 @@ function recentCutoffMs(days: number): number {
   return Date.now() - days * 24 * 60 * 60 * 1000;
 }
 
-function logCutoffSeconds(days: number): number {
-  return Math.floor(recentCutoffMs(days) / 1000);
-}
-
-function logTargetPruneParams(): Record<string, string> {
-  return Object.fromEntries(LOG_TARGETS_TO_PRUNE.map((target, index) => [`logTarget${index}`, target]));
-}
-
 function secondsToIso(seconds: number | null): string | null {
   return seconds == null ? null : new Date(seconds * 1000).toISOString();
 }
@@ -2266,6 +2202,8 @@ export function emitReport(report: Record<string, unknown>, asJson: boolean): vo
 function printHumanReport(report: Record<string, unknown>): void {
   console.log(`codex-cleaner: ${String(report.action ?? "scan")} (${String(report.mode ?? "read-only")})`);
   console.log(`Codex home: ${String(report.codexHome)}`);
+  if (report.sqliteHome) console.log(`SQLite home: ${String(report.sqliteHome)}`);
+  if (report.logDir) console.log(`Log dir: ${String(report.logDir)}`);
   console.log(`Generated: ${String(report.generatedAt)}`);
   if (report.policy) console.log(`Policy: ${JSON.stringify(report.policy)}`);
 
@@ -2315,17 +2253,16 @@ function printHumanReport(report: Record<string, unknown>): void {
   printCandidate("Compact candidates archived-only", report.compactMetadataCandidatesArchivedOnly);
   printArchiveCandidate("Stale archive candidates", report.staleArchiveCandidates);
   printOrphanRolloutArchiveCandidate("Orphan rollout archive candidates", report.orphanRolloutArchiveCandidates);
-  printLogCleanupCandidate("Log cleanup candidates", report.logCleanupCandidates);
   printTuiLogCleanupCandidate("TUI log cleanup candidate", report.tuiLogCleanupCandidates);
   if (report.action === "checkpoint-wal") {
     printWalCheckpoint(report);
+  } else if (report.action === "vacuum-state" || report.action === "vacuum-logs") {
+    printVacuumSummary(report.action === "vacuum-state" ? "State vacuum" : "Logs vacuum", report);
   } else {
     printCandidate("Before", report.before);
     printCandidate("After", report.after);
     printArchiveCandidate("Before", report.before);
     printArchiveCandidate("After", report.after);
-    printLogCleanupCandidate("Before", report.before);
-    printLogCleanupCandidate("After", report.after);
   }
 
   if (report.changedRows !== undefined) console.log(`\nChanged rows: ${String(report.changedRows)}`);
@@ -2374,7 +2311,7 @@ function printCleanApplySummary(report: Record<string, unknown>): void {
   printOrphanRolloutSummary(orphanRollouts);
   printCompactApplySummary(compact);
   printVacuumSummary("State vacuum", vacuum);
-  printLogsApplySummary(logs);
+  printVacuumSummary("Logs vacuum", logs);
   printTuiLogApplySummary(tuiLog);
   if (Object.keys(checkpoint).length) printWalCheckpoint(checkpoint);
   printBackupReminder([archive, compact, vacuum, logs, tuiLog]);
@@ -2446,36 +2383,6 @@ function printVacuumSummary(title: string, report: Record<string, unknown>): voi
   console.log(`\n${title}:`);
   console.log(`  main file: ${String(beforeMain.mib ?? 0)} MiB -> ${String(afterMain.mib ?? 0)} MiB`);
   console.log(`  freelist: ${String(beforeSpace.free_mib ?? 0)} MiB -> ${String(afterSpace.free_mib ?? 0)} MiB`);
-  if (report.backupPath) console.log(`  backup: ${String(report.backupPath)}`);
-}
-
-function printLogsApplySummary(report: Record<string, unknown>): void {
-  if (!Object.keys(report).length) return;
-  const before = asRecord(report.before);
-  const after = asRecord(report.after);
-  const beforeFiles = asRecord(report.beforeFiles);
-  const afterFiles = asRecord(report.afterFiles);
-  const beforeMain = asRecord(beforeFiles.main);
-  const afterMain = asRecord(afterFiles.main);
-  const beforeSpace = asRecord(report.beforeSpace);
-  const afterSpace = asRecord(report.afterSpace);
-  console.log("\nLogs cleanup:");
-  console.log(`  deleted rows: ${String(report.deletedRows ?? 0)}`);
-  console.log(`  capped rows: ${String(report.cappedRows ?? 0)}`);
-  console.log(
-    `  remaining cleanup candidates: delete=${String(after.delete_rows ?? 0)} noisy=${String(
-      after.target_prune_rows ?? 0,
-    )} cap=${String(after.cap_rows ?? 0)}`,
-  );
-  console.log(
-    `  estimated savings before apply: delete=${String(
-      before.delete_estimated_payload_mib ?? 0,
-    )} MiB noisy=${String(before.target_prune_estimated_payload_mib ?? 0)} MiB cap=${String(
-      before.cap_estimated_savings_mib ?? 0,
-    )} MiB`,
-  );
-  console.log(`  logs file: ${String(beforeMain.mib ?? 0)} MiB -> ${String(afterMain.mib ?? 0)} MiB`);
-  console.log(`  logs freelist: ${String(beforeSpace.free_mib ?? 0)} MiB -> ${String(afterSpace.free_mib ?? 0)} MiB`);
   if (report.backupPath) console.log(`  backup: ${String(report.backupPath)}`);
 }
 
@@ -2631,24 +2538,6 @@ function printOrphanRolloutArchiveCandidate(title: string, value: unknown): void
     "skipped_destination_exists_files",
     "oldest_candidate_modified_utc",
     "newest_candidate_modified_utc",
-  ]) {
-    if (object[key] !== undefined) console.log(`  ${key}: ${JSON.stringify(object[key])}`);
-  }
-}
-
-function printLogCleanupCandidate(title: string, value: unknown): void {
-  const object = asRecord(value);
-  if (!Object.keys(object).length) return;
-  console.log(`\n${title}:`);
-  for (const key of [
-    "rows",
-    "delete_rows",
-    "delete_estimated_payload_mib",
-    "target_prune_rows",
-    "target_prune_estimated_payload_mib",
-    "cap_rows",
-    "cap_estimated_savings_mib",
-    "cutoffUtc",
   ]) {
     if (object[key] !== undefined) console.log(`  ${key}: ${JSON.stringify(object[key])}`);
   }
