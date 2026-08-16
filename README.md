@@ -1,52 +1,35 @@
 # codex-cleaner
 
-Guarded cleanup for local Codex state.
+Simple cleanup for local Codex storage.
 
 ```powershell
 npx codex-cleaner@latest
 ```
 
-The guided flow dry-runs first. Its recommended cleanup:
+The guided flow has two modes. Both scan first and ask once before applying:
 
-- caps large metadata on old, unprotected threads
-- vacuums `state_5.sqlite` and `logs_2.sqlite`
-- checkpoints `state_5.sqlite-wal`
-- creates backups before database changes
+- **Clean up** vacuums free pages in `state_5.sqlite` and `logs_2.sqlite`, then checkpoints the state WAL. It keeps all threads and rollout JSONL.
+- **Full cleanup** also permanently deletes archived threads older than 90 days through Codex's `thread/delete` API. Pinned, active-goal, heartbeat/app-permission, recent, and unsafe descendant trees stay protected.
 
-Codex owns log retention. The cleaner only reclaims free SQLite pages; it does not delete or rewrite log rows.
-
-Expensive or uncommon work is opt-in:
-
-- `--archive-stale` archives old threads through Codex's app-server API
-- `--archive-orphan-rollouts` moves old DB-unreferenced session JSONL into `archived_sessions`
-- `--prune-tui-log` backs up and trims an explicitly enabled `codex-tui.log`
-- `--include-rollouts` adds the slower rollout-linkage scan
-
-SQLite paths resolve in this order: `--sqlite-home`, root-level `sqlite_home` in `config.toml`, `CODEX_SQLITE_HOME`, then `CODEX_HOME`. Log paths use `--log-dir`, root-level `log_dir`, then `CODEX_HOME/log`.
-
-When upgrading from `0.0.x`, add `--archive-stale` if you want `clean` to keep archiving stale threads. Archiving is no longer part of the default cleanup.
-
-Noninteractive dry-run and apply:
+Noninteractive use:
 
 ```powershell
-npx codex-cleaner@latest --allow-running-readonly clean --vacuum-logs
-npx codex-cleaner@latest clean --vacuum-logs --apply
+npx codex-cleaner@latest scan
+npx codex-cleaner@latest clean --apply
+npx codex-cleaner@latest scan --full
+npx codex-cleaner@latest clean --full --keep-days 90 --apply
 ```
 
-Backup cleanup:
+Applying cleanup refuses to run while Codex is active. Database mutations create backups in `~/.codex/.codex-cleanup-backups` and schedule them for removal after 48 hours. The apply summary shows how to cancel that removal. A database backup cannot restore rollout JSONL deleted by Full cleanup.
+
+Backup inspection and removal remain separate:
 
 ```powershell
 npx codex-cleaner@latest backups scan
-npx codex-cleaner@latest backups prune --older-than-hours 48
 npx codex-cleaner@latest backups prune --older-than-hours 48 --apply
 ```
 
-Safety:
-
-- mutations require `--apply` and refuse to run while Codex is active
-- pinned, heartbeat/open, active-goal, and recent threads are protected
-- rollout JSONL is never deleted by the cleanup flow
-- backups default to `~/.codex/.codex-cleanup-backups`
+Version 0.2 removes metadata capping, stale archiving, orphan rollout moving, TUI log trimming, and their flags. SQLite paths still resolve from `--sqlite-home`, root-level `sqlite_home` in `config.toml`, `CODEX_SQLITE_HOME`, then `CODEX_HOME`.
 
 ## Dev
 
