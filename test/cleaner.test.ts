@@ -6,27 +6,28 @@ import { describe, expect, test } from "vitest";
 
 import {
   collectCompactCandidateStats,
-  collectLogCleanupStats,
   collectOrphanRolloutArchiveStats,
   collectTuiLogCleanupStats,
   collectStaleArchiveCandidateStats,
   archiveOrphanRollouts,
+  archiveStaleThreads,
   checkpointWal,
   cleanCodex,
-  cleanLogs,
   cleanTuiLog,
   compactWhere,
   nextFileBackupPath,
   nextBackupPath,
   pruneBackups,
   resolveCodexSpawnCommand,
+  resolveStoragePaths,
   rolloutThreadId,
   scanBackups,
   scheduleBackupPrune,
   truncateFileToTail,
+  vacuumLogsDatabase,
 } from "../src/cleaner.js";
 import type { CleanerOptions } from "../src/types.js";
-import { recommendedWizardOptions } from "../src/wizard.js";
+import { buildCleanCommand, recommendedWizardOptions } from "../src/wizard.js";
 
 function defaultOptions(overrides: Partial<CleanerOptions> = {}): CleanerOptions {
   return {
@@ -35,20 +36,18 @@ function defaultOptions(overrides: Partial<CleanerOptions> = {}): CleanerOptions
     afterHours: 48,
     apply: false,
     archiveOrphanRollouts: false,
-    archiveStale: true,
+    archiveStale: false,
     archivedOnly: false,
     compactRecentMetadata: false,
     includeLogs: false,
     includeRollouts: false,
     json: false,
-    keepLogDays: 7,
     keepRecentDays: 14,
     keepTuiLogMib: 16,
     maxChars: 1024,
-    maxLogBodyChars: 4096,
     olderThanHours: 48,
-    pruneLogs: false,
     pruneTuiLog: false,
+    vacuumLogs: false,
     ...overrides,
   };
 }
@@ -59,10 +58,10 @@ describe("recommendedWizardOptions", () => {
 
     expect(options.apply).toBe(false);
     expect(options.allowRunningReadonly).toBe(true);
-    expect(options.archiveOrphanRollouts).toBe(true);
-    expect(options.archiveStale).toBe(true);
-    expect(options.pruneLogs).toBe(true);
-    expect(options.pruneTuiLog).toBe(true);
+    expect(options.archiveOrphanRollouts).toBe(false);
+    expect(options.archiveStale).toBe(false);
+    expect(options.pruneTuiLog).toBe(false);
+    expect(options.vacuumLogs).toBe(true);
   });
 });
 
@@ -203,6 +202,70 @@ describe("resolveCodexSpawnCommand", () => {
   });
 });
 
+describe("archiveStaleThreads", () => {
+  test.skipIf(process.platform !== "win32")(
+    "overrides conflicting Codex storage for app-server mutations",
+    async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+      const sqliteHome = path.join(dir, "sqlite");
+      const capturePath = path.join(dir, "app-server-env.json");
+      const shim = path.join(dir, "codex.cmd");
+      const script = path.join(dir, "node_modules", "@openai", "codex", "bin", "codex.js");
+      fs.mkdirSync(sqliteHome, { recursive: true });
+      const db = new DatabaseSync(path.join(sqliteHome, "state_5.sqlite"));
+      try {
+        fs.mkdirSync(path.dirname(script), { recursive: true });
+        fs.writeFileSync(shim, "");
+        fs.writeFileSync(path.join(dir, "config.toml"), "sqlite_home = 'configured-elsewhere'\n");
+        fs.writeFileSync(
+          script,
+          `const fs = require("node:fs");
+const readline = require("node:readline");
+fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args: process.argv.slice(2), sqliteHome: process.env.CODEX_SQLITE_HOME }));
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.id) process.stdout.write(JSON.stringify({ id: message.id, result: {} }) + "\\n");
+});
+`,
+        );
+        db.exec(`
+        CREATE TABLE threads (
+          id TEXT PRIMARY KEY,
+          archived INTEGER NOT NULL DEFAULT 0,
+          archived_at INTEGER,
+          rollout_path TEXT NOT NULL,
+          updated_at INTEGER NOT NULL,
+          updated_at_ms INTEGER,
+          cwd TEXT NOT NULL,
+          title TEXT NOT NULL
+        );
+        CREATE TABLE thread_spawn_edges (
+          parent_thread_id TEXT NOT NULL,
+          child_thread_id TEXT NOT NULL PRIMARY KEY,
+          status TEXT NOT NULL
+        );
+        INSERT INTO threads VALUES ('old-thread', 0, NULL, '', 1, 1, 'cwd', 'old');
+      `);
+        db.close();
+
+        const report = await archiveStaleThreads(
+          defaultOptions({ apply: true, codexCommand: shim, codexHome: dir, sqliteHome }),
+        );
+
+        expect(report.requestedArchiveCalls).toBe(1);
+        expect(JSON.parse(fs.readFileSync(capturePath, "utf8"))).toEqual({
+          args: ["-c", `sqlite_home=${JSON.stringify(sqliteHome)}`, "app-server", "--listen", "stdio://"],
+          sqliteHome,
+        });
+      } finally {
+        if (db.isOpen) db.close();
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
 describe("nextBackupPath", () => {
   test("does not reuse an existing backup name in the same millisecond", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
@@ -239,105 +302,113 @@ describe("nextFileBackupPath", () => {
   });
 });
 
-describe("collectLogCleanupStats", () => {
-  test("counts old rows separately from oversized retained log bodies", () => {
+describe("storage paths", () => {
+  test("uses CLI paths before config and config before CODEX_SQLITE_HOME", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
-    const db = new DatabaseSync(path.join(dir, "logs_2.sqlite"));
     try {
-      db.exec(`
-        CREATE TABLE logs (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts INTEGER NOT NULL,
-          ts_nanos INTEGER NOT NULL,
-          level TEXT NOT NULL,
-          target TEXT NOT NULL,
-          feedback_log_body TEXT,
-          module_path TEXT,
-          file TEXT,
-          line INTEGER,
-          thread_id TEXT,
-          process_uuid TEXT,
-          estimated_bytes INTEGER NOT NULL DEFAULT 0
-        )
-      `);
-      const insert = db.prepare(
-        "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, estimated_bytes) VALUES (?, 0, 'INFO', ?, ?, ?)",
-      );
-      insert.run(100, "target", "old body".repeat(100), 1000);
-      insert.run(Math.floor(Date.now() / 1000), "target", "x".repeat(50), 50);
-      insert.run(Math.floor(Date.now() / 1000), "target", "y".repeat(200000), 200000);
-      insert.run(Math.floor(Date.now() / 1000), "codex_otel.log_only", "noisy", 100);
+      fs.writeFileSync(path.join(dir, "config.toml"), "sqlite_home = 'config-state'\nlog_dir = 'config-logs'\n");
 
-      const stats = collectLogCleanupStats(
-        db,
-        defaultOptions({
-          includeLogs: true,
-          maxLogBodyChars: 100,
-          pruneLogs: true,
-        }),
-      );
+      expect(resolveStoragePaths(defaultOptions({ codexHome: dir }), { CODEX_SQLITE_HOME: "env-state" })).toEqual({
+        codexHome: dir,
+        logDir: path.join(dir, "config-logs"),
+        sqliteHome: path.join(dir, "config-state"),
+      });
 
-      expect(stats.delete_rows).toBe(1);
-      expect(stats.target_prune_rows).toBe(1);
-      expect(stats.cap_rows).toBe(1);
-      expect(stats.cap_estimated_savings_mib).toBeGreaterThan(0);
+      expect(
+        resolveStoragePaths(
+          defaultOptions({
+            codexHome: dir,
+            logDir: path.join(dir, "cli-logs"),
+            sqliteHome: path.join(dir, "cli-state"),
+          }),
+          { CODEX_SQLITE_HOME: "env-state" },
+        ),
+      ).toEqual({
+        codexHome: dir,
+        logDir: path.join(dir, "cli-logs"),
+        sqliteHome: path.join(dir, "cli-state"),
+      });
+
+      fs.writeFileSync(
+        path.join(dir, "config.toml"),
+        "sqlite_home = { unsupported = 'value' }\nlog_dir = 'config-logs'\n",
+      );
+      expect(resolveStoragePaths(defaultOptions({ codexHome: dir, sqliteHome: path.join(dir, "cli-state") }))).toEqual({
+        codexHome: dir,
+        logDir: path.join(dir, "config-logs"),
+        sqliteHome: path.join(dir, "cli-state"),
+      });
     } finally {
-      db.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("prunes noisy persistent log targets before capping retained bodies", async () => {
+  test("resolves a relative CODEX_SQLITE_HOME when config has no override", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    try {
+      const relativeSqliteHome = path.join("relative", "sqlite");
+
+      expect(
+        resolveStoragePaths(defaultOptions({ codexHome: dir }), { CODEX_SQLITE_HOME: relativeSqliteHome }),
+      ).toEqual({
+        codexHome: dir,
+        logDir: path.join(dir, "log"),
+        sqliteHome: path.resolve(relativeSqliteHome),
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps cleanup options and balanced storage targets in deferred commands", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
+    try {
+      const sqliteHome = path.join(dir, "state's");
+      const options = defaultOptions({
+        codexHome: dir,
+        keepTuiLogMib: 64,
+        logDir: path.join(dir, "logs"),
+        pruneTuiLog: true,
+        sqliteHome,
+        vacuumLogs: true,
+      });
+      const command = buildCleanCommand(options, true, "win32");
+
+      expect(command).toContain(`--codex-home '${dir}'`);
+      expect(command).toContain(`--sqlite-home '${sqliteHome.replaceAll("'", "''")}'`);
+      expect(command).toContain(`--log-dir '${path.join(dir, "logs")}'`);
+      expect(command).toContain("--vacuum-logs");
+      expect(command).toContain("--prune-tui-log --keep-tui-log-mib 64");
+      expect(command).toMatch(/ --apply$/);
+
+      const posixCommand = buildCleanCommand(options, false, "linux");
+      expect(posixCommand).toContain(`--sqlite-home '${sqliteHome.replaceAll("'", `'"'"'`)}'`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("logs vacuum", () => {
+  test("reclaims free pages without changing Codex-owned log rows", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-cleaner-"));
     const dbPath = path.join(dir, "logs_2.sqlite");
     const db = new DatabaseSync(dbPath);
     try {
-      db.exec(`
-        CREATE TABLE logs (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts INTEGER NOT NULL,
-          ts_nanos INTEGER NOT NULL,
-          level TEXT NOT NULL,
-          target TEXT NOT NULL,
-          feedback_log_body TEXT,
-          module_path TEXT,
-          file TEXT,
-          line INTEGER,
-          thread_id TEXT,
-          process_uuid TEXT,
-          estimated_bytes INTEGER NOT NULL DEFAULT 0
-        )
-      `);
-      const insert = db.prepare(
-        "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, estimated_bytes) VALUES (?, 0, ?, ?, ?, ?)",
-      );
-      const recent = Math.floor(Date.now() / 1000);
-      insert.run(100, "INFO", "keep", "old", 3);
-      insert.run(recent, "TRACE", "log", "x".repeat(200000), 200000);
-      insert.run(recent, "INFO", "keep", "y".repeat(200000), 200000);
-      insert.run(recent, "INFO", "keep", "small", 5);
+      db.exec("CREATE TABLE logs (id INTEGER PRIMARY KEY, body TEXT NOT NULL)");
+      const insert = db.prepare("INSERT INTO logs (body) VALUES (?)");
+      for (let index = 0; index < 20; index += 1) insert.run("x".repeat(50_000));
+      db.exec("DELETE FROM logs WHERE id > 1");
+      const sizeBefore = fs.statSync(dbPath).size;
       db.close();
 
-      const report = await cleanLogs(
-        defaultOptions({
-          apply: true,
-          codexHome: dir,
-          maxLogBodyChars: 100,
-          pruneLogs: true,
-        }),
-      );
+      const report = await vacuumLogsDatabase(defaultOptions({ apply: true, codexHome: dir }));
 
       const after = new DatabaseSync(dbPath);
       try {
-        expect(report.deletedRows).toBe(2);
-        expect(report.cappedRows).toBe(1);
-        expect(after.prepare("SELECT count(*) AS rows FROM logs WHERE target = 'log'").get()).toEqual({ rows: 0 });
-        expect(after.prepare("SELECT count(*) AS rows FROM logs WHERE feedback_log_body = 'old'").get()).toEqual({
-          rows: 0,
-        });
-        expect(after.prepare("SELECT max(length(feedback_log_body)) AS max_len FROM logs").get()).toEqual({
-          max_len: 100,
-        });
+        expect(after.prepare("SELECT count(*) AS rows FROM logs").get()).toEqual({ rows: 1 });
+        expect(fs.statSync(dbPath).size).toBeLessThan(sizeBefore);
+        expect(fs.existsSync(String(report.backupPath))).toBe(true);
       } finally {
         after.close();
       }

@@ -23,14 +23,14 @@ export type CleanerOptions = {
   includeLogs: boolean;
   includeRollouts: boolean;
   json: boolean;
-  keepLogDays: number;
   keepRecentDays: number;
   keepTuiLogMib: number;
-  maxLogBodyChars: number;
+  logDir?: string;
   maxChars: number;
   olderThanHours: number;
-  pruneLogs: boolean;
   pruneTuiLog: boolean;
+  sqliteHome?: string;
+  vacuumLogs: boolean;
 };
 
 export type BlockingProcess = {
